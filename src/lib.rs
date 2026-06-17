@@ -2410,6 +2410,7 @@ Read the project rules from `{agent_rules_path}` and the overview from `{overvie
 - Output only a valid JSON object. Do not wrap it in markdown.
 - The object must contain `version`, `runId`, `branch`, `specFile`, and `tasks`.
 - Each task must be narrowly scoped, actionable, and include explicit negative constraints from the spec.
+- Each task's `reviewCriteria`, `dependsOn`, and `verificationCommands` fields must be JSON arrays. Do not emit a single string for array fields.
 - Preserve existing project boundaries. Do not invent unrelated APIs, tables, or features.
 "#;
 
@@ -3431,7 +3432,11 @@ pub struct Task {
     pub spec_file: Option<String>,
     #[serde(rename = "dependsOn", default)]
     pub depends_on: Vec<String>,
-    #[serde(rename = "reviewCriteria", default)]
+    #[serde(
+        rename = "reviewCriteria",
+        default,
+        deserialize_with = "deserialize_string_vec_from_string_or_array"
+    )]
     pub review_criteria: Vec<String>,
     #[serde(rename = "analyzeTimeoutSeconds", default)]
     pub analyze_timeout_seconds: Option<u64>,
@@ -3447,6 +3452,26 @@ pub struct Task {
     pub verification_commands: Vec<VerificationCommand>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+fn deserialize_string_vec_from_string_or_array<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrArray {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    Ok(match StringOrArray::deserialize(deserializer)? {
+        StringOrArray::One(value) if value.trim().is_empty() => Vec::new(),
+        StringOrArray::One(value) => vec![value],
+        StringOrArray::Many(values) => values,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7998,6 +8023,38 @@ printf '   \n' > "{}"
                 .unwrap()
                 .join("escape")
                 .exists()
+        );
+    }
+
+    #[test]
+    fn task_review_criteria_accepts_legacy_string_and_serializes_array() {
+        let raw = r#"{
+  "version": 2,
+  "runId": "criteria",
+  "branch": "feat/criteria",
+  "specFile": "docs/roadmap/criteria.md",
+  "tasks": [
+    {
+      "id": "p1",
+      "priority": 1,
+      "title": "Task",
+      "output": "output/p1.md",
+      "prompt": "Do it.",
+      "reviewCriteria": "Must pass review."
+    }
+  ]
+}"#;
+
+        let task_file: TaskFile = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            task_file.tasks[0].review_criteria,
+            vec!["Must pass review."]
+        );
+
+        let encoded = serde_json::to_value(&task_file).unwrap();
+        assert_eq!(
+            encoded["tasks"][0]["reviewCriteria"],
+            serde_json::json!(["Must pass review."])
         );
     }
 
