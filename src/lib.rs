@@ -866,6 +866,12 @@ pub fn run_doctor(start: &Path) -> DoctorReport {
                         status: DoctorStatus::Ok,
                         message: context.profile_path.display().to_string(),
                     });
+                } else if context.merged.prompts.profile == "default" {
+                    checks.push(DoctorCheck {
+                        name: "global-profile".to_string(),
+                        status: DoctorStatus::Ok,
+                        message: "built-in default profile".to_string(),
+                    });
                 } else {
                     checks.push(DoctorCheck {
                         name: "global-profile".to_string(),
