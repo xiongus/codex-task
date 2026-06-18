@@ -2441,7 +2441,7 @@ This is a read-only analysis phase. Do not modify code, tests, task state, or ot
 ## Feature Specification
 {feature_spec}
 
-Write the analysis report to `{output_analysis_path}`. The report must cover current state, gaps, implementation plan, risks, and acceptance criteria.
+Write the analysis report to `{output_analysis_path}` when the sandbox allows it. If the sandbox blocks file writes, return the complete Markdown analysis report as your final message with no code fences; the runner will persist it. The report must cover current state, gaps, implementation plan, risks, and acceptance criteria.
 "#;
 
 const IMPLEMENT_TASK_TEMPLATE: &str = r#"# Autonomous Task Runner
@@ -2518,7 +2518,7 @@ This is a read-only review. Do not modify code, tests, task state, or other task
 ## Implementation Summary ({output_impl_path})
 {implementation_summary}
 
-Write a Markdown review report to `{output_review_path}` with YAML frontmatter:
+Write a Markdown review report to `{output_review_path}` when the sandbox allows it. If the sandbox blocks file writes, return the exact Markdown review report as your final message with no code fences; the message must start with this YAML frontmatter:
 
 ```markdown
 ---
@@ -2554,7 +2554,7 @@ This is a read-only final feature review. Do not edit `tasks.json`, `state.json`
 ## Completed Task Summaries
 {tasks_summaries}
 
-Write a Markdown final review report to `{output_feature_review_path}` with YAML frontmatter containing `verdict: APPROVED` or `verdict: CHANGES_REQUESTED`.
+Write a Markdown final review report to `{output_feature_review_path}` when the sandbox allows it. If the sandbox blocks file writes, return the exact Markdown final review report as your final message with no code fences. The report must contain YAML frontmatter with `verdict: APPROVED` or `verdict: CHANGES_REQUESTED`.
 
 MVP rule: final review may report integration issues, but it must not append tasks or modify run state.
 "#;
@@ -2898,23 +2898,55 @@ impl CodexExecutor {
             match fs::read_to_string(output_path) {
                 Ok(value) if !value.trim().is_empty() => {}
                 Ok(_) => {
-                    return Err(self.error(
-                        request,
-                        CodexFailureKind::EmptyRequiredOutput,
-                        Some(exit_code),
-                        &format!("required codex output {} is empty", output_path.display()),
-                    ));
+                    if request.sandbox == "read-only" {
+                        if let Err(err) =
+                            write_required_output_from_last_message(output_path, &last_message)
+                        {
+                            return Err(self.error(
+                                request,
+                                CodexFailureKind::Io,
+                                Some(exit_code),
+                                &format!(
+                                    "failed to write required output {} from last message: {err}",
+                                    output_path.display()
+                                ),
+                            ));
+                        }
+                    } else {
+                        return Err(self.error(
+                            request,
+                            CodexFailureKind::EmptyRequiredOutput,
+                            Some(exit_code),
+                            &format!("required codex output {} is empty", output_path.display()),
+                        ));
+                    }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(self.error(
-                        request,
-                        CodexFailureKind::MissingRequiredOutput,
-                        Some(exit_code),
-                        &format!(
-                            "required codex output {} was not written",
-                            output_path.display()
-                        ),
-                    ));
+                    if request.sandbox == "read-only" {
+                        if let Err(err) =
+                            write_required_output_from_last_message(output_path, &last_message)
+                        {
+                            return Err(self.error(
+                                request,
+                                CodexFailureKind::Io,
+                                Some(exit_code),
+                                &format!(
+                                    "failed to write required output {} from last message: {err}",
+                                    output_path.display()
+                                ),
+                            ));
+                        }
+                    } else {
+                        return Err(self.error(
+                            request,
+                            CodexFailureKind::MissingRequiredOutput,
+                            Some(exit_code),
+                            &format!(
+                                "required codex output {} was not written",
+                                output_path.display()
+                            ),
+                        ));
+                    }
                 }
                 Err(err) => {
                     return Err(self.error(
@@ -2958,6 +2990,19 @@ impl CodexExecutor {
             required_output_path: request.required_output_path.clone(),
         })
     }
+}
+
+fn write_required_output_from_last_message(path: &Path, last_message: &str) -> std::io::Result<()> {
+    if last_message.trim().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "last message is empty",
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, last_message)
 }
 
 fn kill_child_tree(child: &mut std::process::Child) {
@@ -7631,6 +7676,83 @@ printf 'stderr line\n' >&2
 
     #[cfg(unix)]
     #[test]
+    fn codex_executor_persists_last_message_as_required_output_for_read_only_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = fake_codex_script(
+            temp.path(),
+            r#"
+last=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    last="$1"
+  fi
+  shift || break
+done
+printf '# Analysis\n\nRead-only report.\n' > "$last"
+"#,
+        );
+        let mut request = sample_codex_request(temp.path());
+        let required_output_path = temp.path().join("readonly-output.md");
+        request.required_output_path = Some(required_output_path.clone());
+        request.sandbox = "read-only".to_string();
+
+        let output = CodexExecutor::new(CodexExecutorConfig {
+            repo_root: temp.path().to_path_buf(),
+            codex_bin: script,
+            model: None,
+            reasoning_effort: None,
+            search: false,
+            dangerous_bypass_approvals_and_sandbox: false,
+        })
+        .execute(&request)
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(
+            fs::read_to_string(required_output_path).unwrap(),
+            "# Analysis\n\nRead-only report.\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_executor_rejects_empty_last_message_for_read_only_required_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = fake_codex_script(
+            temp.path(),
+            r#"
+last=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    last="$1"
+  fi
+  shift || break
+done
+printf '   \n' > "$last"
+"#,
+        );
+        let mut request = sample_codex_request(temp.path());
+        request.required_output_path = Some(temp.path().join("readonly-output.md"));
+        request.sandbox = "read-only".to_string();
+
+        let error = CodexExecutor::new(CodexExecutorConfig {
+            repo_root: temp.path().to_path_buf(),
+            codex_bin: script,
+            model: None,
+            reasoning_effort: None,
+            search: false,
+            dangerous_bypass_approvals_and_sandbox: false,
+        })
+        .execute(&request)
+        .unwrap_err();
+
+        assert_eq!(error.kind, CodexFailureKind::EmptyLastMessage);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn codex_executor_fails_on_nonzero_missing_output_and_timeout() {
         let temp = tempfile::tempdir().unwrap();
 
@@ -9402,12 +9524,7 @@ printf 'review complete\n' > "$last"
         assert_eq!(p1.phase, Some(TaskPhase::Review));
         assert_eq!(p1.review_attempts, 1);
         assert_eq!(p1.last_verdict, None);
-        assert!(
-            p1.last_error
-                .as_deref()
-                .unwrap()
-                .contains("required codex output")
-        );
+        assert!(p1.last_error.as_deref().unwrap().contains("review"));
     }
 
     #[cfg(unix)]
