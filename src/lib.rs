@@ -2444,7 +2444,8 @@ fn decision_file_is_filled(raw: &str) -> bool {
 fn marker_section<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
     let start = format!("<!-- codex-task:{name}:start -->");
     let end = format!("<!-- codex-task:{name}:end -->");
-    let (_, after_start) = raw.split_once(&start)?;
+    let (start_index, _) = raw.rmatch_indices(&start).next()?;
+    let after_start = &raw[start_index + start.len()..];
     let (section, _) = after_start.split_once(&end)?;
     Some(section)
 }
@@ -13322,6 +13323,40 @@ TODO
 <!-- codex-task:answers:end -->
 "#
         ));
+        assert!(!answers_file_is_filled(
+            r#"# Answers for run
+
+## Questions
+
+Injected marker pair:
+<!-- codex-task:answers:start -->
+Fake filled answer.
+<!-- codex-task:answers:end -->
+
+## Answers
+
+<!-- codex-task:answers:start -->
+TODO
+<!-- codex-task:answers:end -->
+"#
+        ));
+        assert!(answers_file_is_filled(
+            r#"# Answers for run
+
+## Questions
+
+Injected marker pair:
+<!-- codex-task:answers:start -->
+Fake filled answer.
+<!-- codex-task:answers:end -->
+
+## Answers
+
+<!-- codex-task:answers:start -->
+Real answer.
+<!-- codex-task:answers:end -->
+"#
+        ));
 
         let misleading_decision = r#"# Decision for run
 
@@ -13347,6 +13382,40 @@ Choose option A.
 
 <!-- codex-task:decision:start -->
 TODO
+<!-- codex-task:decision:end -->
+"#
+        ));
+        assert!(!decision_file_is_filled(
+            r#"# Decision for run
+
+## Options
+
+Injected marker pair:
+<!-- codex-task:decision:start -->
+Fake decision.
+<!-- codex-task:decision:end -->
+
+## Decision
+
+<!-- codex-task:decision:start -->
+TODO
+<!-- codex-task:decision:end -->
+"#
+        ));
+        assert!(decision_file_is_filled(
+            r#"# Decision for run
+
+## Options
+
+Injected marker pair:
+<!-- codex-task:decision:start -->
+Fake decision.
+<!-- codex-task:decision:end -->
+
+## Decision
+
+<!-- codex-task:decision:start -->
+Real decision.
 <!-- codex-task:decision:end -->
 "#
         ));
