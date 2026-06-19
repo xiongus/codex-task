@@ -1,9 +1,11 @@
 use clap::{Parser, Subcommand};
 use codex_task::{
-    AppError, FinalizeOptions, ReviewOptions, RunTaskOptions, StartOptions, StatusResult,
-    TaskPhase, VerifyOptions, WatchOptions, finalize_run, find_repo_root, format_doctor_text,
-    format_status_text, home_dir, init_project, load_status, review_task, run_doctor, run_one_task,
-    start_run, verify_tasks, watch_run,
+    AppError, FinalizeOptions, InspectOptions, LogsOptions, ResetTaskOptions, ReviewOptions,
+    RunTaskOptions, StartOptions, StatusResult, TaskPhase, VerifyOptions, WatchOptions,
+    finalize_run, find_repo_root, format_doctor_text, format_inspect_text, format_logs_text,
+    format_reset_text, format_status_text, home_dir, init_project, inspect_run, load_status,
+    read_run_logs, reset_task, review_task, run_doctor, run_one_task, start_run, verify_tasks,
+    watch_run,
 };
 use std::path::PathBuf;
 
@@ -34,6 +36,36 @@ enum Commands {
         /// Run id under the repository run store.
         #[arg(long)]
         run_id: Option<String>,
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show run store, active/archive paths, and editable task/state files.
+    Inspect {
+        /// Run id under the repository run store. Archived runs are searched when no active run exists.
+        #[arg(long)]
+        run_id: Option<String>,
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List or print run logs from active or archived run artifacts.
+    Logs {
+        /// Run id under the repository run store. Archived runs are searched when no active run exists.
+        #[arg(long)]
+        run_id: Option<String>,
+        /// Filter logs to one task id.
+        #[arg(long)]
+        task_id: Option<String>,
+        /// Filter logs to one phase, e.g. analyze, implement, verify, review.
+        #[arg(long)]
+        phase: Option<String>,
+        /// Only show the newest matching log file.
+        #[arg(long)]
+        latest: bool,
+        /// Print the last N lines of matching logs instead of listing paths.
+        #[arg(long)]
+        tail: Option<usize>,
         /// Print machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -99,6 +131,26 @@ enum Commands {
         /// Keep run artifacts after final review. Cleanup is not implemented in this milestone.
         #[arg(long)]
         no_cleanup: bool,
+    },
+    /// Reset a non-done task back to a runnable phase after manual fixes.
+    Reset {
+        /// Task id to reset.
+        task_id: String,
+        /// Run id under the repository run store.
+        #[arg(long)]
+        run_id: Option<String>,
+        /// Runnable phase to reset to. Defaults to implement.
+        #[arg(long, value_enum)]
+        phase: Option<FromPhase>,
+        /// Clear normal attempts so maxAttempts no longer blocks the next run.
+        #[arg(long)]
+        clear_attempts: bool,
+        /// Clear review attempts so maxReviewAttempts no longer blocks review.
+        #[arg(long)]
+        clear_review_attempts: bool,
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -182,6 +234,50 @@ fn run(cli: Cli) -> Result<i32, AppError> {
                         println!("{message}");
                     }
                 }
+            }
+            Ok(0)
+        }
+        Commands::Inspect { run_id, json } => {
+            let view = inspect_run(&cwd, InspectOptions { run_id })?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&view).map_err(|err| AppError::Runtime(
+                        format!("failed to encode JSON: {err}")
+                    ))?
+                );
+            } else {
+                print!("{}", format_inspect_text(&view));
+            }
+            Ok(0)
+        }
+        Commands::Logs {
+            run_id,
+            task_id,
+            phase,
+            latest,
+            tail,
+            json,
+        } => {
+            let view = read_run_logs(
+                &cwd,
+                LogsOptions {
+                    run_id,
+                    task_id,
+                    phase,
+                    latest,
+                    tail_lines: tail,
+                },
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&view).map_err(|err| AppError::Runtime(
+                        format!("failed to encode JSON: {err}")
+                    ))?
+                );
+            } else {
+                print!("{}", format_logs_text(&view));
             }
             Ok(0)
         }
@@ -278,6 +374,36 @@ fn run(cli: Cli) -> Result<i32, AppError> {
             )?;
             println!("{}", result.message);
             Ok(result.exit_code)
+        }
+        Commands::Reset {
+            task_id,
+            run_id,
+            phase,
+            clear_attempts,
+            clear_review_attempts,
+            json,
+        } => {
+            let result = reset_task(
+                &cwd,
+                ResetTaskOptions {
+                    run_id,
+                    task_id,
+                    phase: phase.unwrap_or(FromPhase::Implement).into_task_phase(),
+                    clear_attempts,
+                    clear_review_attempts,
+                },
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).map_err(|err| AppError::Runtime(
+                        format!("failed to encode JSON: {err}")
+                    ))?
+                );
+            } else {
+                print!("{}", format_reset_text(&result));
+            }
+            Ok(0)
         }
     }
 }

@@ -11,7 +11,7 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 
 pub const PROMPT_TEMPLATE_NAMES: [&str; 5] = [
@@ -3682,6 +3682,98 @@ pub struct FinalizeOptions {
     pub codex_bin: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectOptions {
+    pub run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogsOptions {
+    pub run_id: Option<String>,
+    pub task_id: Option<String>,
+    pub phase: Option<String>,
+    pub latest: bool,
+    pub tail_lines: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetTaskOptions {
+    pub run_id: Option<String>,
+    pub task_id: String,
+    pub phase: TaskPhase,
+    pub clear_attempts: bool,
+    pub clear_review_attempts: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunInspectView {
+    pub repo_root: PathBuf,
+    pub repo_runs_dir: PathBuf,
+    pub active_runs: Vec<String>,
+    pub archived_runs: Vec<ArchivedRunView>,
+    pub selected: Option<RunLocationView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunLocationView {
+    pub run_id: String,
+    pub run_dir: PathBuf,
+    pub location: String,
+    pub archive_name: Option<String>,
+    pub tasks_path: PathBuf,
+    pub state_path: PathBuf,
+    pub metadata_path: PathBuf,
+    pub logs_dir: PathBuf,
+    pub output_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArchivedRunView {
+    pub run_id: String,
+    pub archive_name: String,
+    pub run_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LogsView {
+    pub run_id: String,
+    pub run_dir: PathBuf,
+    pub location: String,
+    pub archive_name: Option<String>,
+    pub logs_dir: PathBuf,
+    pub files: Vec<LogFileView>,
+    pub tails: Vec<LogTailView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LogFileView {
+    pub name: String,
+    pub path: PathBuf,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LogTailView {
+    pub name: String,
+    pub path: PathBuf,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResetTaskResult {
+    pub run_id: String,
+    pub task_id: String,
+    pub phase: String,
+    pub tasks_path: PathBuf,
+    pub state_path: PathBuf,
+    pub attempts: u64,
+    pub max_attempts: u64,
+    pub review_attempts: u64,
+    pub max_review_attempts: u64,
+    pub warnings: Vec<String>,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SchedulerResult {
     pub run_id: String,
@@ -4302,6 +4394,324 @@ pub fn finalize_run_in_repo(
     })
 }
 
+pub fn inspect_run(
+    start: &Path,
+    options: InspectOptions,
+) -> std::result::Result<RunInspectView, AppError> {
+    let repo_root = find_repo_root(start)?;
+    let home = home_dir()?;
+    inspect_run_in_repo(&repo_root, &home, options)
+}
+
+pub fn inspect_run_in_repo(
+    repo_root: &Path,
+    home: &Path,
+    options: InspectOptions,
+) -> std::result::Result<RunInspectView, AppError> {
+    let context = load_config(repo_root, home, true)?;
+    let store = RunStore::for_repo(&context.repo_root, &context.home_dir)
+        .map_err(|err| AppError::Runtime(format!("failed to resolve run store: {err}")))?;
+    let active_runs = discover_run_ids(&store.repo_runs_dir)?;
+    let archived_runs = discover_archived_runs(&store)?;
+    let selected = match options.run_id.as_deref() {
+        Some(_) => Some(resolve_existing_run_location(
+            &store,
+            options.run_id.as_deref(),
+        )?),
+        None if active_runs.len() == 1 => Some(resolve_existing_run_location(
+            &store,
+            Some(&active_runs[0]),
+        )?),
+        None => None,
+    };
+
+    Ok(RunInspectView {
+        repo_root: context.repo_root,
+        repo_runs_dir: store.repo_runs_dir,
+        active_runs,
+        archived_runs,
+        selected,
+    })
+}
+
+pub fn format_inspect_text(view: &RunInspectView) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Repo: {}\n", view.repo_root.display()));
+    out.push_str(&format!("Run store: {}\n", view.repo_runs_dir.display()));
+    if view.active_runs.is_empty() {
+        out.push_str("Active runs: (none)\n");
+    } else {
+        out.push_str(&format!("Active runs: {}\n", view.active_runs.join(", ")));
+    }
+    if view.archived_runs.is_empty() {
+        out.push_str("Archived runs: (none)\n");
+    } else {
+        out.push_str("Archived runs:\n");
+        for archived in &view.archived_runs {
+            out.push_str(&format!(
+                "- {} ({}) {}\n",
+                archived.run_id,
+                archived.archive_name,
+                archived.run_dir.display()
+            ));
+        }
+    }
+    if let Some(selected) = &view.selected {
+        out.push_str("\nSelected run\n");
+        out.push_str(&format!("Run: {}\n", selected.run_id));
+        out.push_str(&format!("Location: {}\n", selected.location));
+        if let Some(archive_name) = &selected.archive_name {
+            out.push_str(&format!("Archive: {archive_name}\n"));
+        }
+        out.push_str(&format!("Run dir: {}\n", selected.run_dir.display()));
+        out.push_str(&format!("Tasks: {}\n", selected.tasks_path.display()));
+        out.push_str(&format!("State: {}\n", selected.state_path.display()));
+        out.push_str(&format!("Metadata: {}\n", selected.metadata_path.display()));
+        out.push_str(&format!("Logs: {}\n", selected.logs_dir.display()));
+        out.push_str(&format!("Output: {}\n", selected.output_dir.display()));
+    }
+    out
+}
+
+pub fn read_run_logs(
+    start: &Path,
+    options: LogsOptions,
+) -> std::result::Result<LogsView, AppError> {
+    let repo_root = find_repo_root(start)?;
+    let home = home_dir()?;
+    read_run_logs_in_repo(&repo_root, &home, options)
+}
+
+pub fn read_run_logs_in_repo(
+    repo_root: &Path,
+    home: &Path,
+    options: LogsOptions,
+) -> std::result::Result<LogsView, AppError> {
+    let context = load_config(repo_root, home, true)?;
+    let store = RunStore::for_repo(&context.repo_root, &context.home_dir)
+        .map_err(|err| AppError::Runtime(format!("failed to resolve run store: {err}")))?;
+    let location = resolve_existing_run_location(&store, options.run_id.as_deref())?;
+    let logs_dir = location.logs_dir.clone();
+    let mut files = discover_log_files(
+        &logs_dir,
+        options.task_id.as_deref(),
+        options.phase.as_deref(),
+    )?;
+    if options.latest
+        && files.len() > 1
+        && let Some(latest) = files
+            .iter()
+            .max_by_key(|file| log_modified_key(&file.path))
+            .cloned()
+    {
+        files = vec![latest];
+    }
+
+    let tails = match options.tail_lines {
+        Some(lines) => files
+            .iter()
+            .map(|file| {
+                Ok(LogTailView {
+                    name: file.name.clone(),
+                    path: file.path.clone(),
+                    text: read_last_lines(&file.path, lines)?,
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, AppError>>()?,
+        None => Vec::new(),
+    };
+
+    Ok(LogsView {
+        run_id: location.run_id,
+        run_dir: location.run_dir,
+        location: location.location,
+        archive_name: location.archive_name,
+        logs_dir,
+        files,
+        tails,
+    })
+}
+
+pub fn format_logs_text(view: &LogsView) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Run: {}\n", view.run_id));
+    out.push_str(&format!("Location: {}\n", view.location));
+    if let Some(archive_name) = &view.archive_name {
+        out.push_str(&format!("Archive: {archive_name}\n"));
+    }
+    out.push_str(&format!("Logs: {}\n", view.logs_dir.display()));
+
+    if view.files.is_empty() {
+        out.push_str("No matching logs.\n");
+        return out;
+    }
+
+    if view.tails.is_empty() {
+        for file in &view.files {
+            out.push_str(&format!(
+                "- {} ({} bytes) {}\n",
+                file.name,
+                file.bytes,
+                file.path.display()
+            ));
+        }
+        return out;
+    }
+
+    for tail in &view.tails {
+        out.push_str(&format!("\n== {} ==\n", tail.path.display()));
+        out.push_str(&tail.text);
+        if !tail.text.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+pub fn reset_task(
+    start: &Path,
+    options: ResetTaskOptions,
+) -> std::result::Result<ResetTaskResult, AppError> {
+    let repo_root = find_repo_root(start)?;
+    let home = home_dir()?;
+    reset_task_in_repo(&repo_root, &home, options)
+}
+
+pub fn reset_task_in_repo(
+    repo_root: &Path,
+    home: &Path,
+    options: ResetTaskOptions,
+) -> std::result::Result<ResetTaskResult, AppError> {
+    let context = load_config(repo_root, home, true)?;
+    let store = RunStore::for_repo(&context.repo_root, &context.home_dir)
+        .map_err(|err| AppError::Runtime(format!("failed to resolve run store: {err}")))?;
+    let run_id = select_run_id(&store, options.run_id.as_deref())?;
+    let _execution_lock = store.try_acquire_execution_lock(&run_id)?;
+    recover_stale_running_tasks(&store, &run_id)?;
+    let task_file = store.read_task_file(&run_id)?;
+    let task = find_task(&task_file, &options.task_id)?.clone();
+    if matches!(options.phase, TaskPhase::AnalysisReview | TaskPhase::Done) {
+        return Err(AppError::Config(format!(
+            "reset phase {} is not runnable",
+            options.phase.as_str()
+        )));
+    }
+
+    let now = current_timestamp()?;
+    let reset = store.update_run_state(&run_id, |state| {
+        ensure_state_matches_tasks(&task_file, state)?;
+        let task_state = state
+            .tasks
+            .iter_mut()
+            .find(|candidate| candidate.id == task.id)
+            .expect("state was normalized");
+        if task_state.status == TaskStatus::Done {
+            return Err(AppError::Runtime(format!(
+                "task {} is already done; refusing to reset committed work",
+                task.id
+            )));
+        }
+        if task_state.status == TaskStatus::Ignored {
+            return Err(AppError::Runtime(format!(
+                "task {} is ignored; edit state.json manually if you really want to resurrect it",
+                task.id
+            )));
+        }
+        if task_state.status == TaskStatus::Running {
+            return Err(AppError::Runtime(format!(
+                "task {} is still running; stop the runner or wait for stale recovery first",
+                task.id
+            )));
+        }
+
+        task_state.status = TaskStatus::Pending;
+        task_state.phase = Some(options.phase);
+        task_state.started_at = None;
+        task_state.finished_at = None;
+        task_state.updated_at = Some(now.clone());
+        task_state.last_error = None;
+        task_state.last_exit_code = None;
+        task_state.last_log = None;
+        task_state.last_verdict = None;
+        task_state.last_review_comments = None;
+        clear_runner_marker(task_state);
+        if options.clear_attempts {
+            task_state.attempts = 0;
+        }
+        if options.clear_review_attempts {
+            task_state.review_attempts = 0;
+        }
+
+        Ok((
+            task_state.attempts,
+            task_state.review_attempts,
+            task_state.phase.expect("phase was set"),
+        ))
+    })?;
+
+    let max_attempts = task_max_attempts(&task);
+    let max_review_attempts = task_max_review_attempts(&task);
+    let mut warnings = Vec::new();
+    if !matches!(
+        reset.2,
+        TaskPhase::Verify | TaskPhase::Review | TaskPhase::Commit
+    ) && reset.0 >= max_attempts
+    {
+        warnings.push(format!(
+            "attempts is still {}/{}; increase maxAttempts in tasks.json or rerun reset with --clear-attempts",
+            reset.0, max_attempts
+        ));
+    }
+    if reset.2 == TaskPhase::Review && reset.1 >= max_review_attempts {
+        warnings.push(format!(
+            "reviewAttempts is still {}/{}; increase maxReviewAttempts in tasks.json or rerun reset with --clear-review-attempts",
+            reset.1, max_review_attempts
+        ));
+    }
+
+    Ok(ResetTaskResult {
+        run_id: run_id.clone(),
+        task_id: task.id.clone(),
+        phase: reset.2.as_str().to_string(),
+        tasks_path: store.tasks_path(&run_id)?,
+        state_path: store.state_path(&run_id)?,
+        attempts: reset.0,
+        max_attempts,
+        review_attempts: reset.1,
+        max_review_attempts,
+        warnings,
+        message: format!(
+            "Reset task {} to pending phase {}",
+            task.id,
+            reset.2.as_str()
+        ),
+    })
+}
+
+pub fn format_reset_text(result: &ResetTaskResult) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("{}\n", result.message));
+    out.push_str(&format!("Run: {}\n", result.run_id));
+    out.push_str(&format!("Tasks: {}\n", result.tasks_path.display()));
+    out.push_str(&format!("State: {}\n", result.state_path.display()));
+    out.push_str(&format!(
+        "Attempts: {}/{}\n",
+        result.attempts, result.max_attempts
+    ));
+    out.push_str(&format!(
+        "Review attempts: {}/{}\n",
+        result.review_attempts, result.max_review_attempts
+    ));
+    for warning in &result.warnings {
+        out.push_str(&format!("warning: {warning}\n"));
+    }
+    out.push_str(&format!(
+        "Next: codex-task run {} --run-id {} --from {}\n",
+        result.task_id, result.run_id, result.phase
+    ));
+    out
+}
+
 pub fn load_status(
     repo_root: &Path,
     home_dir: &Path,
@@ -4362,6 +4772,200 @@ fn select_run_id(
             ))),
         },
     }
+}
+
+fn resolve_existing_run_location(
+    store: &RunStore,
+    requested: Option<&str>,
+) -> std::result::Result<RunLocationView, AppError> {
+    match requested {
+        Some(run_id) => {
+            RunId::parse(run_id)?;
+            let active = store.run_dir(run_id)?;
+            if active.exists() {
+                return Ok(run_location_view(run_id.to_string(), active, false, None));
+            }
+            let archives = discover_archived_runs(store)?
+                .into_iter()
+                .filter(|archive| archive.run_id == run_id)
+                .collect::<Vec<_>>();
+            if let Some(archive) = archives.last() {
+                return Ok(run_location_view(
+                    archive.run_id.clone(),
+                    archive.run_dir.clone(),
+                    true,
+                    Some(archive.archive_name.clone()),
+                ));
+            }
+            Err(AppError::Runtime(format!(
+                "run {run_id} does not exist under {} or its archive",
+                store.repo_runs_dir.display()
+            )))
+        }
+        None => {
+            let active_runs = discover_run_ids(&store.repo_runs_dir)?;
+            if active_runs.len() == 1 {
+                let run_id = active_runs[0].clone();
+                return Ok(run_location_view(
+                    run_id.clone(),
+                    store.run_dir(&run_id)?,
+                    false,
+                    None,
+                ));
+            }
+            if active_runs.len() > 1 {
+                return Err(AppError::Config(format!(
+                    "Multiple active runs found under {}: {}. Pass --run-id.",
+                    store.repo_runs_dir.display(),
+                    active_runs.join(", ")
+                )));
+            }
+
+            let archives = discover_archived_runs(store)?;
+            if archives.len() == 1 {
+                let archive = &archives[0];
+                return Ok(run_location_view(
+                    archive.run_id.clone(),
+                    archive.run_dir.clone(),
+                    true,
+                    Some(archive.archive_name.clone()),
+                ));
+            }
+            if archives.is_empty() {
+                Err(AppError::Runtime(format!(
+                    "No runs found under {}",
+                    store.repo_runs_dir.display()
+                )))
+            } else {
+                let names = archives
+                    .iter()
+                    .map(|archive| format!("{} ({})", archive.run_id, archive.archive_name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(AppError::Config(format!(
+                    "Multiple archived runs found under {}: {names}. Pass --run-id.",
+                    store.repo_runs_dir.join("archive").display()
+                )))
+            }
+        }
+    }
+}
+
+fn run_location_view(
+    run_id: String,
+    run_dir: PathBuf,
+    archived: bool,
+    archive_name: Option<String>,
+) -> RunLocationView {
+    RunLocationView {
+        run_id,
+        tasks_path: run_dir.join("tasks.json"),
+        state_path: run_dir.join("state.json"),
+        metadata_path: run_dir.join("metadata.json"),
+        logs_dir: run_dir.join("logs"),
+        output_dir: run_dir.join("output"),
+        run_dir,
+        location: if archived { "archive" } else { "active" }.to_string(),
+        archive_name,
+    }
+}
+
+fn discover_archived_runs(store: &RunStore) -> std::result::Result<Vec<ArchivedRunView>, AppError> {
+    let archive_root = store.repo_runs_dir.join("archive");
+    if !archive_root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut archives = Vec::new();
+    for entry in fs::read_dir(&archive_root)
+        .map_err(|err| AppError::Io(format!("failed to read {}: {err}", archive_root.display())))?
+    {
+        let entry = entry.map_err(|err| {
+            AppError::Io(format!(
+                "failed to read {} entry: {err}",
+                archive_root.display()
+            ))
+        })?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let archive_name = entry.file_name().to_string_lossy().to_string();
+        let run_id = read_task_file(&path.join("tasks.json"))
+            .map(|task_file| task_file.run_id)
+            .unwrap_or_else(|_| archive_name.clone());
+        archives.push(ArchivedRunView {
+            run_id,
+            archive_name,
+            run_dir: path,
+        });
+    }
+    archives.sort_by(|left, right| {
+        left.run_id
+            .cmp(&right.run_id)
+            .then_with(|| left.archive_name.cmp(&right.archive_name))
+    });
+    Ok(archives)
+}
+
+fn discover_log_files(
+    logs_dir: &Path,
+    task_id: Option<&str>,
+    phase: Option<&str>,
+) -> std::result::Result<Vec<LogFileView>, AppError> {
+    if !logs_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for entry in fs::read_dir(logs_dir)
+        .map_err(|err| AppError::Io(format!("failed to read {}: {err}", logs_dir.display())))?
+    {
+        let entry = entry.map_err(|err| {
+            AppError::Io(format!(
+                "failed to read {} entry: {err}",
+                logs_dir.display()
+            ))
+        })?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(task_id) = task_id
+            && !name.starts_with(&format!("{task_id}."))
+        {
+            continue;
+        }
+        if let Some(phase) = phase
+            && !name.contains(&format!(".{phase}."))
+        {
+            continue;
+        }
+        let bytes = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        files.push(LogFileView { name, path, bytes });
+    }
+    files.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(files)
+}
+
+fn log_modified_key(path: &Path) -> SystemTime {
+    path.metadata()
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+fn read_last_lines(path: &Path, max_lines: usize) -> std::result::Result<String, AppError> {
+    let text = fs::read_to_string(path)
+        .map_err(|err| AppError::Io(format!("failed to read {}: {err}", path.display())))?;
+    if max_lines == 0 {
+        return Ok(String::new());
+    }
+    let lines = text.lines().collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(max_lines);
+    let mut out = lines[start..].join("\n");
+    if text.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 fn recover_stale_running_tasks(
@@ -10158,6 +10762,124 @@ add_include = [".codex/**", "src/**"]
         let spec_text = fs::read_to_string(repo.join("spec.md")).unwrap();
         assert!(spec_text.contains("status: done"));
         assert!(spec_text.contains("finished_at: 20"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_and_logs_can_read_archived_run_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let home = temp.path().join("home");
+        init_test_repo(&repo);
+        write_spec_and_commit(&repo, "spec.md");
+
+        let task_file = sample_run_task_file("run", "spec.md", vec![sample_task("p1", 1)]);
+        let store = RunStore::for_repo(&repo, &home).unwrap();
+        store.write_task_file("run", &task_file).unwrap();
+        store
+            .write_run_state("run", &initial_run_state(&task_file))
+            .unwrap();
+        let run_dir = store.run_dir("run").unwrap();
+        fs::create_dir_all(run_dir.join("logs")).unwrap();
+        fs::write(
+            run_dir.join("logs/p1.implement.stderr.log"),
+            "line one\nline two\n",
+        )
+        .unwrap();
+
+        let archive_dir = store.repo_runs_dir.join("archive/run-2026-06-18T00-00-00Z");
+        fs::create_dir_all(archive_dir.parent().unwrap()).unwrap();
+        fs::rename(&run_dir, &archive_dir).unwrap();
+
+        let inspect = inspect_run_in_repo(
+            &repo,
+            &home,
+            InspectOptions {
+                run_id: Some("run".to_string()),
+            },
+        )
+        .unwrap();
+        let selected = inspect.selected.unwrap();
+        assert_eq!(selected.location, "archive");
+        assert_eq!(
+            selected.archive_name,
+            Some("run-2026-06-18T00-00-00Z".to_string())
+        );
+
+        let logs = read_run_logs_in_repo(
+            &repo,
+            &home,
+            LogsOptions {
+                run_id: Some("run".to_string()),
+                task_id: Some("p1".to_string()),
+                phase: Some("implement".to_string()),
+                latest: true,
+                tail_lines: Some(1),
+            },
+        )
+        .unwrap();
+        assert_eq!(logs.location, "archive");
+        assert_eq!(logs.files.len(), 1);
+        assert_eq!(logs.tails[0].text, "line two\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_blocked_task_to_runnable_phase_with_attempt_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let home = temp.path().join("home");
+        init_test_repo(&repo);
+        write_spec_and_commit(&repo, "spec.md");
+
+        let mut task = sample_task("p1", 1);
+        task.max_attempts = Some(1);
+        let task_file = sample_run_task_file("run", "spec.md", vec![task]);
+        let store = RunStore::for_repo(&repo, &home).unwrap();
+        store.write_task_file("run", &task_file).unwrap();
+        let mut state = initial_run_state(&task_file);
+        state.tasks[0].status = TaskStatus::Blocked;
+        state.tasks[0].phase = Some(TaskPhase::Implement);
+        state.tasks[0].attempts = 1;
+        state.tasks[0].last_error = Some("maxAttempts 1 reached".to_string());
+        store.write_run_state("run", &state).unwrap();
+
+        let result = reset_task_in_repo(
+            &repo,
+            &home,
+            ResetTaskOptions {
+                run_id: Some("run".to_string()),
+                task_id: "p1".to_string(),
+                phase: TaskPhase::Implement,
+                clear_attempts: false,
+                clear_review_attempts: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.phase, "implement");
+        assert_eq!(result.attempts, 1);
+        assert_eq!(result.warnings.len(), 1);
+
+        let state = store.read_run_state("run").unwrap();
+        assert_eq!(state.tasks[0].status, TaskStatus::Pending);
+        assert_eq!(state.tasks[0].phase, Some(TaskPhase::Implement));
+        assert_eq!(state.tasks[0].attempts, 1);
+        assert_eq!(state.tasks[0].last_error, None);
+
+        let result = reset_task_in_repo(
+            &repo,
+            &home,
+            ResetTaskOptions {
+                run_id: Some("run".to_string()),
+                task_id: "p1".to_string(),
+                phase: TaskPhase::Implement,
+                clear_attempts: true,
+                clear_review_attempts: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.attempts, 0);
+        assert!(result.warnings.is_empty());
     }
 
     fn verification_command(
