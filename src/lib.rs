@@ -14,12 +14,28 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 
-pub const PROMPT_TEMPLATE_NAMES: [&str; 5] = [
+pub const PROMPT_TEMPLATE_NAMES: [&str; 9] = [
+    "requirement-review.md",
+    "resolve-requirement.md",
     "decompose-feature.md",
     "analyze-task.md",
     "implement-task.md",
     "review-task.md",
     "review-feature.md",
+    "final-review-shard.md",
+    "final-review-aggregate.md",
+];
+
+const FINAL_REVIEW_TYPES: [&str; 9] = [
+    "architecture/integration",
+    "business-scenario",
+    "backward-compatibility",
+    "code-defect",
+    "performance",
+    "security",
+    "data-migration",
+    "test-coverage",
+    "docs-contract",
 ];
 
 const TASK_STATUS_ORDER: [TaskStatus; 8] = [
@@ -57,6 +73,7 @@ default_task_timeout_seconds = 1800
 default_analyze_timeout_seconds = 900
 default_review_timeout_seconds = 600
 default_verify_timeout_seconds = 1800
+max_final_review_rounds = 2
 max_consecutive_failures = 3
 
 [prompts]
@@ -241,6 +258,171 @@ impl ReviewVerdict {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RequirementReviewStatus {
+    #[default]
+    Pending,
+    Running,
+    Clear,
+    NeedsClarification,
+    Resolved,
+    Failed,
+}
+
+impl RequirementReviewStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RequirementReviewStatus::Pending => "pending",
+            RequirementReviewStatus::Running => "running",
+            RequirementReviewStatus::Clear => "clear",
+            RequirementReviewStatus::NeedsClarification => "needs_clarification",
+            RequirementReviewStatus::Resolved => "resolved",
+            RequirementReviewStatus::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequirementReviewState {
+    #[serde(default)]
+    pub status: RequirementReviewStatus,
+    #[serde(rename = "reviewedAt", default)]
+    pub reviewed_at: Option<String>,
+    #[serde(rename = "resolvedAt", default)]
+    pub resolved_at: Option<String>,
+    #[serde(rename = "questionsPath", default)]
+    pub questions_path: Option<String>,
+    #[serde(rename = "answersPath", default)]
+    pub answers_path: Option<String>,
+    #[serde(rename = "resolvedSpecPath", default)]
+    pub resolved_spec_path: Option<String>,
+    #[serde(default)]
+    pub output: Option<String>,
+    #[serde(rename = "lastError", default)]
+    pub last_error: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl Default for RequirementReviewState {
+    fn default() -> Self {
+        Self {
+            status: RequirementReviewStatus::Pending,
+            reviewed_at: None,
+            resolved_at: None,
+            questions_path: None,
+            answers_path: None,
+            resolved_spec_path: None,
+            output: None,
+            last_error: None,
+            extra: Map::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FindingSeverity {
+    #[serde(rename = "MUST_FIX")]
+    MustFix,
+    #[serde(rename = "SHOULD_FIX")]
+    ShouldFix,
+    #[serde(rename = "INFO")]
+    Info,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinalReviewFinding {
+    pub id: String,
+    #[serde(rename = "reviewType")]
+    pub review_type: String,
+    pub severity: FindingSeverity,
+    pub title: String,
+    pub detail: String,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FinalReviewShardState {
+    #[serde(rename = "reviewType")]
+    pub review_type: String,
+    pub status: FeatureReviewStatus,
+    #[serde(default)]
+    pub verdict: Option<ReviewVerdict>,
+    #[serde(default)]
+    pub output: Option<String>,
+    #[serde(rename = "stdoutLog", default)]
+    pub stdout_log: Option<String>,
+    #[serde(rename = "stderrLog", default)]
+    pub stderr_log: Option<String>,
+    #[serde(rename = "lastMessage", default)]
+    pub last_message: Option<String>,
+    #[serde(rename = "findingsCount", default)]
+    pub findings_count: usize,
+    #[serde(rename = "lastError", default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FinalReviewRoundState {
+    pub round: u64,
+    pub status: FeatureReviewStatus,
+    #[serde(rename = "startedAt", default)]
+    pub started_at: Option<String>,
+    #[serde(rename = "finishedAt", default)]
+    pub finished_at: Option<String>,
+    #[serde(rename = "changeMapPath", default)]
+    pub change_map_path: Option<String>,
+    #[serde(rename = "reviewPlanPath", default)]
+    pub review_plan_path: Option<String>,
+    #[serde(rename = "findingsPath", default)]
+    pub findings_path: Option<String>,
+    #[serde(rename = "aggregateOutput", default)]
+    pub aggregate_output: Option<String>,
+    #[serde(rename = "finalFixTaskId", default)]
+    pub final_fix_task_id: Option<String>,
+    #[serde(default)]
+    pub shards: Vec<FinalReviewShardState>,
+    #[serde(rename = "remainingMustFix", default)]
+    pub remaining_must_fix: Vec<FinalReviewFinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinalReviewState {
+    #[serde(default = "default_feature_review_status")]
+    pub status: FeatureReviewStatus,
+    #[serde(rename = "maxRounds", default)]
+    pub max_rounds: u64,
+    #[serde(rename = "changeMapPath", default)]
+    pub change_map_path: Option<String>,
+    #[serde(rename = "reviewPlanPath", default)]
+    pub review_plan_path: Option<String>,
+    #[serde(rename = "findingsPath", default)]
+    pub findings_path: Option<String>,
+    #[serde(default)]
+    pub rounds: Vec<FinalReviewRoundState>,
+    #[serde(rename = "remainingMustFix", default)]
+    pub remaining_must_fix: Vec<FinalReviewFinding>,
+    #[serde(rename = "lastError", default)]
+    pub last_error: Option<String>,
+}
+
+impl Default for FinalReviewState {
+    fn default() -> Self {
+        Self {
+            status: FeatureReviewStatus::Pending,
+            max_rounds: 0,
+            change_map_path: None,
+            review_plan_path: None,
+            findings_path: None,
+            rounds: Vec::new(),
+            remaining_must_fix: Vec::new(),
+            last_error: None,
+        }
+    }
+}
+
 const DEFAULT_VERIFICATION_COMMAND_NAME: &str = "task-check";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -357,6 +539,7 @@ pub struct RunnerConfig {
     pub default_analyze_timeout_seconds: u64,
     pub default_review_timeout_seconds: u64,
     pub default_verify_timeout_seconds: u64,
+    pub max_final_review_rounds: u64,
     pub max_consecutive_failures: u64,
 }
 
@@ -411,6 +594,7 @@ impl MergedConfig {
                 default_analyze_timeout_seconds: 900,
                 default_review_timeout_seconds: 600,
                 default_verify_timeout_seconds: 1800,
+                max_final_review_rounds: 2,
                 max_consecutive_failures: 3,
             },
             prompts: PromptConfig {
@@ -500,6 +684,9 @@ impl MergedConfig {
             if let Some(value) = runner.default_verify_timeout_seconds {
                 self.runner.default_verify_timeout_seconds = value;
             }
+            if let Some(value) = runner.max_final_review_rounds {
+                self.runner.max_final_review_rounds = value;
+            }
             if let Some(value) = runner.max_consecutive_failures {
                 self.runner.max_consecutive_failures = value;
             }
@@ -567,6 +754,11 @@ impl MergedConfig {
                 "runner.reasoning_effort must not be empty".to_string(),
             ));
         }
+        if self.runner.max_final_review_rounds == 0 {
+            return Err(AppError::Config(
+                "runner.max_final_review_rounds must be greater than zero".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -612,6 +804,7 @@ pub struct RunnerConfigPatch {
     pub default_analyze_timeout_seconds: Option<u64>,
     pub default_review_timeout_seconds: Option<u64>,
     pub default_verify_timeout_seconds: Option<u64>,
+    pub max_final_review_rounds: Option<u64>,
     pub max_consecutive_failures: Option<u64>,
 }
 
@@ -1042,15 +1235,26 @@ pub struct StartOptions {
     pub codex_bin: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeOptions {
+    pub run_id: String,
+    pub codex_bin: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StartResult {
     pub run_id: String,
     pub branch: String,
     pub spec_file: String,
     pub run_dir: PathBuf,
+    pub visible_run_dir: PathBuf,
     pub tasks_path: PathBuf,
     pub state_path: PathBuf,
     pub metadata_path: PathBuf,
+    pub requirement_status: String,
+    pub questions_path: Option<PathBuf>,
+    pub answers_path: Option<PathBuf>,
+    pub resolved_spec_path: Option<PathBuf>,
     pub resumed: bool,
     pub warnings: Vec<String>,
 }
@@ -1064,6 +1268,10 @@ pub struct RunMetadata {
     pub branch: String,
     #[serde(rename = "specFile")]
     pub spec_file: String,
+    #[serde(rename = "requirementReview", default)]
+    pub requirement_review: RequirementReviewState,
+    #[serde(rename = "resolvedSpecFile", default)]
+    pub resolved_spec_file: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -1079,6 +1287,171 @@ pub fn start_run(
     let repo_root = find_repo_root(start)?;
     let home = home_dir()?;
     start_run_in_repo(&repo_root, &home, start, options)
+}
+
+pub fn resume_run(
+    start: &Path,
+    options: ResumeOptions,
+) -> std::result::Result<StartResult, AppError> {
+    let repo_root = find_repo_root(start)?;
+    let home = home_dir()?;
+    resume_run_in_repo(&repo_root, &home, options)
+}
+
+pub fn resume_run_in_repo(
+    repo_root: &Path,
+    home: &Path,
+    options: ResumeOptions,
+) -> std::result::Result<StartResult, AppError> {
+    let context = load_config(repo_root, home, true)?;
+    let store = RunStore::for_repo(&context.repo_root, &context.home_dir)
+        .map_err(|err| AppError::Runtime(format!("failed to resolve run store: {err}")))?;
+    RunId::parse(&options.run_id)?;
+    let run_id = options.run_id;
+    let _execution_lock = store.try_acquire_execution_lock(&run_id)?;
+    let metadata = store.read_metadata(&run_id)?;
+    let tasks_path = store.tasks_path(&run_id)?;
+    if tasks_path.exists() {
+        let task_file = store.read_task_file(&run_id)?;
+        ensure_task_file_matches_run(
+            &task_file,
+            &metadata.run_id,
+            &metadata.branch,
+            &task_file.spec_file,
+        )?;
+        return start_result(
+            &context,
+            &store,
+            &run_id,
+            &metadata.branch,
+            &task_file.spec_file,
+            true,
+            Vec::new(),
+        );
+    }
+
+    let mut state = store.read_run_state(&run_id)?;
+    if state.requirement_review.status != RequirementReviewStatus::NeedsClarification {
+        return Err(AppError::Runtime(format!(
+            "run {run_id} is not waiting for requirement answers; status={}",
+            state.requirement_review.status.as_str()
+        )));
+    }
+
+    let visible_dir = project_task_run_dir(&context.repo_root, &run_id);
+    let questions_path = state
+        .requirement_review
+        .questions_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| visible_dir.join("questions.md"));
+    let answers_path = state
+        .requirement_review
+        .answers_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| visible_dir.join("answers.md"));
+    let questions = fs::read_to_string(&questions_path).map_err(|err| {
+        AppError::Io(format!(
+            "failed to read {}: {err}",
+            questions_path.display()
+        ))
+    })?;
+    let answers = fs::read_to_string(&answers_path)
+        .map_err(|err| AppError::Io(format!("failed to read {}: {err}", answers_path.display())))?;
+    if !answers_file_is_filled(&answers) {
+        return Err(AppError::Runtime(format!(
+            "{} has no answers under `## Answers`",
+            answers_path.display()
+        )));
+    }
+
+    let original_spec = SpecDocument::read(&context.repo_root.join(&metadata.spec_file))?;
+    let resolved_spec_path = visible_dir.join("resolved-spec.md");
+    let run_dir = store.run_dir(&run_id)?;
+    let prompt = render_resolve_requirement_prompt(ResolveRequirementRender {
+        context: &context,
+        store: &store,
+        run_id: &run_id,
+        spec_file: &metadata.spec_file,
+        spec: &original_spec,
+        questions: &questions,
+        answers: &answers,
+        output_path: &resolved_spec_path,
+    })?;
+    let request = CodexRunRequest {
+        prompt,
+        prompt_path: run_dir.join("prompts/resolve-requirement.md"),
+        stdout_log_path: run_dir.join("logs/resolve-requirement.stdout.log"),
+        stderr_log_path: run_dir.join("logs/resolve-requirement.stderr.log"),
+        last_message_path: run_dir.join("logs/resolve-requirement.last-message.md"),
+        required_output_path: Some(resolved_spec_path.clone()),
+        sandbox: context.merged.runner.sandbox.clone(),
+        approval: context.merged.runner.approval.clone(),
+        model: context.merged.runner.model.clone(),
+        reasoning_effort: context.merged.runner.reasoning_effort.clone(),
+        search: Some(context.merged.runner.search),
+        timeout_seconds: context.merged.runner.default_analyze_timeout_seconds,
+    };
+    build_executor(&context, options.codex_bin.clone())
+        .execute(&request)
+        .map_err(|err| {
+            AppError::Runtime(format!(
+                "{err}; logs: stdout={}, stderr={}, last={}",
+                err.stdout_log_path.display(),
+                err.stderr_log_path.display(),
+                err.last_message_path.display()
+            ))
+        })?;
+    let resolved_spec = SpecDocument::read(&resolved_spec_path)?;
+    if resolved_spec.body.trim().is_empty() {
+        return Err(AppError::Runtime(format!(
+            "resolved spec {} is empty",
+            resolved_spec_path.display()
+        )));
+    }
+    let resolved_spec_file = repo_relative_slash_path(&context.repo_root, &resolved_spec_path)?;
+
+    state.requirement_review.status = RequirementReviewStatus::Resolved;
+    state.requirement_review.resolved_at = Some(current_timestamp()?);
+    state.requirement_review.resolved_spec_path = Some(resolved_spec_path.display().to_string());
+    state.requirement_review.last_error = None;
+    store.write_run_state(&run_id, &state)?;
+    update_metadata_requirement(
+        &store,
+        &run_id,
+        &state.requirement_review,
+        Some(resolved_spec_file.clone()),
+    )?;
+    append_event_log(
+        &run_dir,
+        &format!(
+            "requirement answers resolved; resolved_spec={}",
+            resolved_spec_path.display()
+        ),
+    )?;
+
+    let mut warnings = Vec::new();
+    run_decompose(DecomposeRun {
+        context: &context,
+        store: &store,
+        run_id: &run_id,
+        branch: &metadata.branch,
+        spec_file: &resolved_spec_file,
+        spec: &resolved_spec,
+        codex_bin: options.codex_bin,
+        warnings: &mut warnings,
+    })?;
+
+    start_result(
+        &context,
+        &store,
+        &run_id,
+        &metadata.branch,
+        &resolved_spec_file,
+        false,
+        warnings,
+    )
 }
 
 pub fn start_run_in_repo(
@@ -1181,11 +1554,23 @@ pub fn start_run_in_repo(
         .map_err(|err| AppError::Io(format!("failed to create {}: {err}", run_dir.display())))?;
 
     let mut warnings = Vec::new();
+    let existing_metadata = if metadata_path.exists() {
+        Some(store.read_metadata(&run_id)?)
+    } else {
+        None
+    };
     let metadata = RunMetadata {
         schema_version: 1,
         run_id: run_id.clone(),
         branch: branch.clone(),
         spec_file: spec_file.clone(),
+        requirement_review: existing_metadata
+            .as_ref()
+            .map(|metadata| metadata.requirement_review.clone())
+            .unwrap_or_default(),
+        resolved_spec_file: existing_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.resolved_spec_file.clone()),
         extra: Map::new(),
     };
     store.write_metadata(&run_id, &metadata)?;
@@ -1217,20 +1602,221 @@ pub fn start_run_in_repo(
         if !state_path.exists() {
             store.write_run_state(&run_id, &initial_run_state(&task_file))?;
         }
-        return Ok(StartResult {
-            run_id,
-            branch,
-            spec_file,
-            run_dir,
-            tasks_path,
-            state_path,
-            metadata_path,
-            resumed: true,
-            warnings,
-        });
+        return start_result(
+            &context, &store, &run_id, &branch, &spec_file, true, warnings,
+        );
     }
 
-    let prompt = render_decompose_prompt(&context, &store, &run_id, &branch, &spec_file, &spec)?;
+    let review_status = run_requirement_review(
+        &context,
+        &store,
+        &run_id,
+        &spec_file,
+        &spec,
+        options.codex_bin.clone(),
+    )?;
+    if review_status != RequirementReviewStatus::Clear {
+        return start_result(
+            &context, &store, &run_id, &branch, &spec_file, false, warnings,
+        );
+    }
+
+    run_decompose(DecomposeRun {
+        context: &context,
+        store: &store,
+        run_id: &run_id,
+        branch: &branch,
+        spec_file: &spec_file,
+        spec: &spec,
+        codex_bin: options.codex_bin,
+        warnings: &mut warnings,
+    })?;
+
+    start_result(
+        &context, &store, &run_id, &branch, &spec_file, false, warnings,
+    )
+}
+
+fn start_result(
+    context: &ConfigContext,
+    store: &RunStore,
+    run_id: &str,
+    branch: &str,
+    spec_file: &str,
+    resumed: bool,
+    warnings: Vec<String>,
+) -> std::result::Result<StartResult, AppError> {
+    let state = store.read_run_state(run_id).unwrap_or_default();
+    let requirement = state.requirement_review;
+    Ok(StartResult {
+        run_id: run_id.to_string(),
+        branch: branch.to_string(),
+        spec_file: spec_file.to_string(),
+        run_dir: store.run_dir(run_id)?,
+        visible_run_dir: project_task_run_dir(&context.repo_root, run_id),
+        tasks_path: store.tasks_path(run_id)?,
+        state_path: store.state_path(run_id)?,
+        metadata_path: store.metadata_path(run_id)?,
+        requirement_status: requirement.status.as_str().to_string(),
+        questions_path: requirement.questions_path.map(PathBuf::from),
+        answers_path: requirement.answers_path.map(PathBuf::from),
+        resolved_spec_path: requirement.resolved_spec_path.map(PathBuf::from),
+        resumed,
+        warnings,
+    })
+}
+
+fn run_requirement_review(
+    context: &ConfigContext,
+    store: &RunStore,
+    run_id: &str,
+    spec_file: &str,
+    spec: &SpecDocument,
+    codex_bin: Option<PathBuf>,
+) -> std::result::Result<RequirementReviewStatus, AppError> {
+    let run_dir = store.run_dir(run_id)?;
+    let visible_dir = project_task_run_dir(&context.repo_root, run_id);
+    fs::create_dir_all(&visible_dir).map_err(|err| {
+        AppError::Io(format!(
+            "failed to create visible run directory {}: {err}",
+            visible_dir.display()
+        ))
+    })?;
+
+    let output_path = run_dir.join("output/requirement-review.md");
+    let questions_path = visible_dir.join("questions.md");
+    let answers_path = visible_dir.join("answers.md");
+    let now = current_timestamp()?;
+    let mut requirement = RequirementReviewState {
+        status: RequirementReviewStatus::Running,
+        questions_path: Some(questions_path.display().to_string()),
+        answers_path: Some(answers_path.display().to_string()),
+        output: Some(output_path.display().to_string()),
+        ..RequirementReviewState::default()
+    };
+    write_requirement_state(store, run_id, &requirement)?;
+    update_metadata_requirement(store, run_id, &requirement, None)?;
+
+    let prompt =
+        render_requirement_review_prompt(context, store, run_id, spec_file, spec, &output_path)?;
+    let request = CodexRunRequest {
+        prompt,
+        prompt_path: run_dir.join("prompts/requirement-review.md"),
+        stdout_log_path: run_dir.join("logs/requirement-review.stdout.log"),
+        stderr_log_path: run_dir.join("logs/requirement-review.stderr.log"),
+        last_message_path: run_dir.join("logs/requirement-review.last-message.md"),
+        required_output_path: Some(output_path.clone()),
+        sandbox: context.merged.runner.review_sandbox.clone(),
+        approval: context.merged.runner.approval.clone(),
+        model: context.merged.runner.model.clone(),
+        reasoning_effort: context.merged.runner.reasoning_effort.clone(),
+        search: Some(context.merged.runner.search),
+        timeout_seconds: context.merged.runner.default_review_timeout_seconds,
+    };
+
+    let _output = match build_executor(context, codex_bin).execute(&request) {
+        Ok(output) => output,
+        Err(err) => {
+            let err = *err;
+            let message = err.message.clone();
+            let stdout_log = err.stdout_log_path.clone();
+            let stderr_log = err.stderr_log_path.clone();
+            let last_message = err.last_message_path.clone();
+            requirement.status = RequirementReviewStatus::Failed;
+            requirement.last_error = Some(message.clone());
+            requirement.output = Some(err.stderr_log_path.display().to_string());
+            write_requirement_state(store, run_id, &requirement)?;
+            update_metadata_requirement(store, run_id, &requirement, None)?;
+            return Err(AppError::Runtime(format!(
+                "{message}; logs: stdout={}, stderr={}, last={}",
+                stdout_log.display(),
+                stderr_log.display(),
+                last_message.display()
+            )));
+        }
+    };
+
+    let decision = match parse_requirement_review_output_file(&output_path) {
+        Ok(decision) => decision,
+        Err(err) => {
+            requirement.status = RequirementReviewStatus::Failed;
+            requirement.last_error = Some(err.clone());
+            write_requirement_state(store, run_id, &requirement)?;
+            update_metadata_requirement(store, run_id, &requirement, None)?;
+            return Err(AppError::Runtime(format!(
+                "invalid requirement review output: {err}; raw output preserved at {}",
+                output_path.display()
+            )));
+        }
+    };
+
+    requirement.status = decision.status;
+    requirement.reviewed_at = Some(now);
+    requirement.output = Some(output_path.display().to_string());
+    requirement.last_error = None;
+
+    match decision.status {
+        RequirementReviewStatus::Clear => {
+            remove_file_if_exists(&questions_path).map_err(|err| {
+                AppError::Io(format!(
+                    "failed to remove {}: {err}",
+                    questions_path.display()
+                ))
+            })?;
+            remove_file_if_exists(&answers_path).map_err(|err| {
+                AppError::Io(format!(
+                    "failed to remove {}: {err}",
+                    answers_path.display()
+                ))
+            })?;
+            requirement.questions_path = None;
+            requirement.answers_path = None;
+            append_event_log(&run_dir, "requirement review clear")?;
+        }
+        RequirementReviewStatus::NeedsClarification => {
+            write_questions_file(&questions_path, run_id, &decision.body)?;
+            write_answers_file(&answers_path, run_id, &decision.body)?;
+            append_event_log(
+                &run_dir,
+                &format!(
+                    "requirement review needs clarification; questions={}, answers={}",
+                    questions_path.display(),
+                    answers_path.display()
+                ),
+            )?;
+        }
+        _ => {}
+    }
+
+    write_requirement_state(store, run_id, &requirement)?;
+    update_metadata_requirement(store, run_id, &requirement, None)?;
+    Ok(decision.status)
+}
+
+struct DecomposeRun<'a> {
+    context: &'a ConfigContext,
+    store: &'a RunStore,
+    run_id: &'a str,
+    branch: &'a str,
+    spec_file: &'a str,
+    spec: &'a SpecDocument,
+    codex_bin: Option<PathBuf>,
+    warnings: &'a mut Vec<String>,
+}
+
+fn run_decompose(input: DecomposeRun<'_>) -> std::result::Result<(), AppError> {
+    let DecomposeRun {
+        context,
+        store,
+        run_id,
+        branch,
+        spec_file,
+        spec,
+        codex_bin,
+        warnings,
+    } = input;
+    let run_dir = store.run_dir(run_id)?;
+    let prompt = render_decompose_prompt(context, store, run_id, branch, spec_file, spec)?;
     let request = CodexRunRequest {
         prompt,
         prompt_path: run_dir.join("prompts/decompose-feature.md"),
@@ -1245,11 +1831,7 @@ pub fn start_run_in_repo(
         search: Some(context.merged.runner.search),
         timeout_seconds: context.merged.runner.default_analyze_timeout_seconds,
     };
-    let mut executor_config = CodexExecutorConfig::from_context(&context);
-    if let Some(codex_bin) = options.codex_bin {
-        executor_config.codex_bin = codex_bin;
-    }
-    let codex_output = CodexExecutor::new(executor_config)
+    let codex_output = build_executor(context, codex_bin)
         .execute(&request)
         .map_err(|err| {
             AppError::Runtime(format!(
@@ -1276,24 +1858,115 @@ pub fn start_run_in_repo(
 
     let mut task_file = parsed.task_file;
     task_file.schema_version = 2;
-    task_file.run_id = run_id.clone();
-    task_file.branch = branch.clone();
-    task_file.spec_file = spec_file.clone();
+    task_file.run_id = run_id.to_string();
+    task_file.branch = branch.to_string();
+    task_file.spec_file = spec_file.to_string();
     validate_task_file(&task_file)?;
-    store.write_task_file(&run_id, &task_file)?;
-    store.write_run_state(&run_id, &initial_run_state(&task_file))?;
+    store.write_task_file(run_id, &task_file)?;
+    let previous_state = store.read_run_state(run_id).unwrap_or_default();
+    let mut next_state = initial_run_state(&task_file);
+    next_state.requirement_review = previous_state.requirement_review;
+    next_state.final_review = previous_state.final_review;
+    store.write_run_state(run_id, &next_state)?;
+    Ok(())
+}
 
-    Ok(StartResult {
-        run_id,
-        branch,
-        spec_file,
-        run_dir,
-        tasks_path,
-        state_path,
-        metadata_path,
-        resumed: false,
-        warnings,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequirementReviewDecision {
+    status: RequirementReviewStatus,
+    body: String,
+}
+
+fn parse_requirement_review_output_file(
+    path: &Path,
+) -> std::result::Result<RequirementReviewDecision, String> {
+    let raw = fs::read_to_string(path).map_err(|err| {
+        format!(
+            "failed to read requirement review output {}: {err}",
+            path.display()
+        )
+    })?;
+    let (frontmatter, body) = parse_review_frontmatter(&raw)?;
+    require_reviewed_at(&frontmatter)?;
+    let status = match frontmatter.get("verdict").as_deref() {
+        Some("CLEAR") => RequirementReviewStatus::Clear,
+        Some("NEEDS_CLARIFICATION") => RequirementReviewStatus::NeedsClarification,
+        Some(value) => return Err(format!("requirement review verdict={value} is invalid")),
+        None => return Err("requirement review output missing verdict".to_string()),
+    };
+    if status == RequirementReviewStatus::NeedsClarification && body.trim().is_empty() {
+        return Err("requirement review questions are empty".to_string());
+    }
+    Ok(RequirementReviewDecision { status, body })
+}
+
+fn write_requirement_state(
+    store: &RunStore,
+    run_id: &str,
+    requirement: &RequirementReviewState,
+) -> std::result::Result<(), AppError> {
+    store.update_run_state(run_id, |state| {
+        state.requirement_review = requirement.clone();
+        Ok(())
     })
+}
+
+fn update_metadata_requirement(
+    store: &RunStore,
+    run_id: &str,
+    requirement: &RequirementReviewState,
+    resolved_spec_file: Option<String>,
+) -> std::result::Result<(), AppError> {
+    let mut metadata = store.read_metadata(run_id)?;
+    metadata.requirement_review = requirement.clone();
+    if resolved_spec_file.is_some() {
+        metadata.resolved_spec_file = resolved_spec_file;
+    }
+    store.write_metadata(run_id, &metadata)
+}
+
+fn project_task_run_dir(repo_root: &Path, run_id: &str) -> PathBuf {
+    repo_root.join(".codex/task-runs").join(run_id)
+}
+
+fn write_questions_file(
+    path: &Path,
+    run_id: &str,
+    questions: &str,
+) -> std::result::Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| AppError::Io(format!("failed to create {}: {err}", parent.display())))?;
+    }
+    let text = format!("# Questions for {run_id}\n\n{}\n", questions.trim());
+    fs::write(path, text)
+        .map_err(|err| AppError::Io(format!("failed to write {}: {err}", path.display())))
+}
+
+fn write_answers_file(
+    path: &Path,
+    run_id: &str,
+    questions: &str,
+) -> std::result::Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| AppError::Io(format!("failed to create {}: {err}", parent.display())))?;
+    }
+    let text = format!(
+        "# Answers for {run_id}\n\nFill in the answers under `## Answers`, then run `codex-task resume --run-id {run_id}`.\n\n## Questions\n\n{}\n\n## Answers\n\nTODO\n",
+        questions.trim()
+    );
+    fs::write(path, text)
+        .map_err(|err| AppError::Io(format!("failed to write {}: {err}", path.display())))
+}
+
+fn answers_file_is_filled(raw: &str) -> bool {
+    let answer_text = raw
+        .split_once("## Answers")
+        .map(|(_, answers)| answers)
+        .unwrap_or(raw)
+        .trim();
+    !answer_text.is_empty() && answer_text != "TODO"
 }
 
 #[derive(Debug, Clone)]
@@ -1623,6 +2296,8 @@ fn discover_run_metadata_for_spec(
                 run_id: task_file.run_id,
                 branch: task_file.branch,
                 spec_file: task_file.spec_file,
+                requirement_review: RequirementReviewState::default(),
+                resolved_spec_file: None,
                 extra: Map::new(),
             }));
         }
@@ -1741,6 +2416,66 @@ fn render_decompose_prompt(
         output_tasks_path: store.tasks_path(run_id)?.display().to_string(),
     };
     let template = load_prompt_template(context, PromptTemplateKind::DecomposeFeature)
+        .map_err(|err| AppError::Config(err.to_string()))?;
+    template
+        .render(&input)
+        .map_err(|err| AppError::Config(err.to_string()))
+}
+
+fn render_requirement_review_prompt(
+    context: &ConfigContext,
+    store: &RunStore,
+    run_id: &str,
+    spec_file: &str,
+    spec: &SpecDocument,
+    output_path: &Path,
+) -> std::result::Result<String, AppError> {
+    let input = RequirementReviewPromptInput {
+        common: common_prompt_variables(context, store, run_id)?,
+        spec_file: spec_file.to_string(),
+        feature_spec: spec.body.clone(),
+        output_review_path: output_path.display().to_string(),
+    };
+    let template = load_prompt_template(context, PromptTemplateKind::RequirementReview)
+        .map_err(|err| AppError::Config(err.to_string()))?;
+    template
+        .render(&input)
+        .map_err(|err| AppError::Config(err.to_string()))
+}
+
+struct ResolveRequirementRender<'a> {
+    context: &'a ConfigContext,
+    store: &'a RunStore,
+    run_id: &'a str,
+    spec_file: &'a str,
+    spec: &'a SpecDocument,
+    questions: &'a str,
+    answers: &'a str,
+    output_path: &'a Path,
+}
+
+fn render_resolve_requirement_prompt(
+    input: ResolveRequirementRender<'_>,
+) -> std::result::Result<String, AppError> {
+    let ResolveRequirementRender {
+        context,
+        store,
+        run_id,
+        spec_file,
+        spec,
+        questions,
+        answers,
+        output_path,
+    } = input;
+    let input = ResolveRequirementPromptInput {
+        common: common_prompt_variables(context, store, run_id)?,
+        spec_file: spec_file.to_string(),
+        feature_spec: spec.body.clone(),
+        questions: questions.to_string(),
+        answers: answers.to_string(),
+        output_resolved_spec_path: output_path.display().to_string(),
+    };
+    let template = load_prompt_template(context, PromptTemplateKind::ResolveRequirement)
         .map_err(|err| AppError::Config(err.to_string()))?;
     template
         .render(&input)
@@ -1874,6 +2609,8 @@ fn ensure_task_file_matches_run(
 fn initial_run_state(task_file: &TaskFile) -> RunState {
     RunState {
         schema_version: 1,
+        requirement_review: RequirementReviewState::default(),
+        final_review: FinalReviewState::default(),
         feature_review_status: FeatureReviewStatus::Pending,
         feature_review_attempts: 0,
         tasks: task_file
@@ -1908,39 +2645,55 @@ fn initial_run_state(task_file: &TaskFile) -> RunState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum PromptTemplateKind {
+    RequirementReview,
+    ResolveRequirement,
     DecomposeFeature,
     AnalyzeTask,
     ImplementTask,
     ReviewTask,
     ReviewFeature,
+    FinalReviewShard,
+    FinalReviewAggregate,
 }
 
 impl PromptTemplateKind {
-    pub const ALL: [PromptTemplateKind; 5] = [
+    pub const ALL: [PromptTemplateKind; 9] = [
+        PromptTemplateKind::RequirementReview,
+        PromptTemplateKind::ResolveRequirement,
         PromptTemplateKind::DecomposeFeature,
         PromptTemplateKind::AnalyzeTask,
         PromptTemplateKind::ImplementTask,
         PromptTemplateKind::ReviewTask,
         PromptTemplateKind::ReviewFeature,
+        PromptTemplateKind::FinalReviewShard,
+        PromptTemplateKind::FinalReviewAggregate,
     ];
 
     pub fn file_name(self) -> &'static str {
         match self {
+            PromptTemplateKind::RequirementReview => "requirement-review.md",
+            PromptTemplateKind::ResolveRequirement => "resolve-requirement.md",
             PromptTemplateKind::DecomposeFeature => "decompose-feature.md",
             PromptTemplateKind::AnalyzeTask => "analyze-task.md",
             PromptTemplateKind::ImplementTask => "implement-task.md",
             PromptTemplateKind::ReviewTask => "review-task.md",
             PromptTemplateKind::ReviewFeature => "review-feature.md",
+            PromptTemplateKind::FinalReviewShard => "final-review-shard.md",
+            PromptTemplateKind::FinalReviewAggregate => "final-review-aggregate.md",
         }
     }
 
     pub fn from_file_name(name: &str) -> Option<Self> {
         match name {
+            "requirement-review.md" => Some(Self::RequirementReview),
+            "resolve-requirement.md" => Some(Self::ResolveRequirement),
             "decompose-feature.md" => Some(Self::DecomposeFeature),
             "analyze-task.md" => Some(Self::AnalyzeTask),
             "implement-task.md" => Some(Self::ImplementTask),
             "review-task.md" => Some(Self::ReviewTask),
             "review-feature.md" => Some(Self::ReviewFeature),
+            "final-review-shard.md" => Some(Self::FinalReviewShard),
+            "final-review-aggregate.md" => Some(Self::FinalReviewAggregate),
             _ => None,
         }
     }
@@ -2092,6 +2845,24 @@ impl CommonPromptVariables {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequirementReviewPromptInput {
+    pub common: CommonPromptVariables,
+    pub spec_file: String,
+    pub feature_spec: String,
+    pub output_review_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveRequirementPromptInput {
+    pub common: CommonPromptVariables,
+    pub spec_file: String,
+    pub feature_spec: String,
+    pub questions: String,
+    pub answers: String,
+    pub output_resolved_spec_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecomposePromptInput {
     pub common: CommonPromptVariables,
     pub spec_file: String,
@@ -2155,6 +2926,75 @@ pub struct ReviewFeaturePromptInput {
     pub git_diff: String,
     pub tasks_summaries: String,
     pub output_feature_review_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalReviewShardPromptInput {
+    pub common: CommonPromptVariables,
+    pub run_id: String,
+    pub branch: String,
+    pub spec_file: String,
+    pub resolved_spec: String,
+    pub review_type: String,
+    pub change_map: String,
+    pub relevant_diff: String,
+    pub relevant_logs: String,
+    pub relevant_files: String,
+    pub output_findings_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalReviewAggregatePromptInput {
+    pub common: CommonPromptVariables,
+    pub run_id: String,
+    pub branch: String,
+    pub spec_file: String,
+    pub resolved_spec: String,
+    pub change_map: String,
+    pub shard_findings: String,
+    pub public_api_summary: String,
+    pub db_summary: String,
+    pub docs_summary: String,
+    pub verification_summary: String,
+    pub output_review_path: String,
+}
+
+impl PromptTemplateInput for RequirementReviewPromptInput {
+    fn kind(&self) -> PromptTemplateKind {
+        PromptTemplateKind::RequirementReview
+    }
+
+    fn variables(&self) -> BTreeMap<String, String> {
+        let mut variables = common_variables(&self.common);
+        variables.insert("spec_file".to_string(), self.spec_file.clone());
+        variables.insert("feature_spec".to_string(), self.feature_spec.clone());
+        variables.insert(
+            "output_review_path".to_string(),
+            self.output_review_path.clone(),
+        );
+        insert_compat_aliases(&mut variables);
+        variables
+    }
+}
+
+impl PromptTemplateInput for ResolveRequirementPromptInput {
+    fn kind(&self) -> PromptTemplateKind {
+        PromptTemplateKind::ResolveRequirement
+    }
+
+    fn variables(&self) -> BTreeMap<String, String> {
+        let mut variables = common_variables(&self.common);
+        variables.insert("spec_file".to_string(), self.spec_file.clone());
+        variables.insert("feature_spec".to_string(), self.feature_spec.clone());
+        variables.insert("questions".to_string(), self.questions.clone());
+        variables.insert("answers".to_string(), self.answers.clone());
+        variables.insert(
+            "output_resolved_spec_path".to_string(),
+            self.output_resolved_spec_path.clone(),
+        );
+        insert_compat_aliases(&mut variables);
+        variables
+    }
 }
 
 impl PromptTemplateInput for DecomposePromptInput {
@@ -2286,6 +3126,63 @@ impl PromptTemplateInput for ReviewFeaturePromptInput {
     }
 }
 
+impl PromptTemplateInput for FinalReviewShardPromptInput {
+    fn kind(&self) -> PromptTemplateKind {
+        PromptTemplateKind::FinalReviewShard
+    }
+
+    fn variables(&self) -> BTreeMap<String, String> {
+        let mut variables = common_variables(&self.common);
+        variables.insert("run_id".to_string(), self.run_id.clone());
+        variables.insert("branch".to_string(), self.branch.clone());
+        variables.insert("spec_file".to_string(), self.spec_file.clone());
+        variables.insert("resolved_spec".to_string(), self.resolved_spec.clone());
+        variables.insert("review_type".to_string(), self.review_type.clone());
+        variables.insert("change_map".to_string(), self.change_map.clone());
+        variables.insert("relevant_diff".to_string(), self.relevant_diff.clone());
+        variables.insert("relevant_logs".to_string(), self.relevant_logs.clone());
+        variables.insert("relevant_files".to_string(), self.relevant_files.clone());
+        variables.insert(
+            "output_findings_path".to_string(),
+            self.output_findings_path.clone(),
+        );
+        insert_compat_aliases(&mut variables);
+        variables
+    }
+}
+
+impl PromptTemplateInput for FinalReviewAggregatePromptInput {
+    fn kind(&self) -> PromptTemplateKind {
+        PromptTemplateKind::FinalReviewAggregate
+    }
+
+    fn variables(&self) -> BTreeMap<String, String> {
+        let mut variables = common_variables(&self.common);
+        variables.insert("run_id".to_string(), self.run_id.clone());
+        variables.insert("branch".to_string(), self.branch.clone());
+        variables.insert("spec_file".to_string(), self.spec_file.clone());
+        variables.insert("resolved_spec".to_string(), self.resolved_spec.clone());
+        variables.insert("change_map".to_string(), self.change_map.clone());
+        variables.insert("shard_findings".to_string(), self.shard_findings.clone());
+        variables.insert(
+            "public_api_summary".to_string(),
+            self.public_api_summary.clone(),
+        );
+        variables.insert("db_summary".to_string(), self.db_summary.clone());
+        variables.insert("docs_summary".to_string(), self.docs_summary.clone());
+        variables.insert(
+            "verification_summary".to_string(),
+            self.verification_summary.clone(),
+        );
+        variables.insert(
+            "output_review_path".to_string(),
+            self.output_review_path.clone(),
+        );
+        insert_compat_aliases(&mut variables);
+        variables
+    }
+}
+
 fn common_variables(common: &CommonPromptVariables) -> BTreeMap<String, String> {
     let mut variables = BTreeMap::new();
     common.insert_into(&mut variables);
@@ -2378,13 +3275,75 @@ fn is_prompt_variable_name(value: &str) -> bool {
 
 fn builtin_prompt_template(kind: PromptTemplateKind) -> &'static str {
     match kind {
+        PromptTemplateKind::RequirementReview => REQUIREMENT_REVIEW_TEMPLATE,
+        PromptTemplateKind::ResolveRequirement => RESOLVE_REQUIREMENT_TEMPLATE,
         PromptTemplateKind::DecomposeFeature => DECOMPOSE_FEATURE_TEMPLATE,
         PromptTemplateKind::AnalyzeTask => ANALYZE_TASK_TEMPLATE,
         PromptTemplateKind::ImplementTask => IMPLEMENT_TASK_TEMPLATE,
         PromptTemplateKind::ReviewTask => REVIEW_TASK_TEMPLATE,
         PromptTemplateKind::ReviewFeature => REVIEW_FEATURE_TEMPLATE,
+        PromptTemplateKind::FinalReviewShard => FINAL_REVIEW_SHARD_TEMPLATE,
+        PromptTemplateKind::FinalReviewAggregate => FINAL_REVIEW_AGGREGATE_TEMPLATE,
     }
 }
+
+const REQUIREMENT_REVIEW_TEMPLATE: &str = r#"# Codex Requirement Reviewer
+
+Current date: {date}
+Repository root: {repo_root}
+Spec file: {spec_file}
+Requirement review output path: {output_review_path}
+
+This is a read-only requirement review. Do not create tasks and do not modify source code.
+
+Read the project rules from `{agent_rules_path}` and the overview from `{overview_doc}`. Decide whether the feature specification is clear enough to decompose into implementation tasks without inventing behavior.
+
+## Repository Map
+```text
+{repo_map}
+```
+
+## Feature Specification
+{feature_spec}
+
+Write a Markdown report to `{output_review_path}` when possible. If the sandbox blocks writes, return the exact report as your final message with no code fences. The report must start with YAML frontmatter:
+
+```markdown
+---
+verdict: CLEAR
+reviewed_at: <RFC3339>
+---
+```
+
+`verdict` must be exactly `CLEAR` or `NEEDS_CLARIFICATION`.
+
+Use `CLEAR` only when a decomposer can produce tasks without guessing user intent, API behavior, data ownership, compatibility rules, or acceptance criteria.
+
+Use `NEEDS_CLARIFICATION` when any material requirement is missing. The body must contain only concrete questions the user must answer.
+"#;
+
+const RESOLVE_REQUIREMENT_TEMPLATE: &str = r#"# Codex Requirement Resolver
+
+Current date: {date}
+Repository root: {repo_root}
+Spec file: {spec_file}
+Resolved spec output path: {output_resolved_spec_path}
+
+This phase resolves a previously blocked requirement review. Do not modify source code or task state.
+
+## Original Feature Specification
+{feature_spec}
+
+## Clarifying Questions
+{questions}
+
+## User Answers
+{answers}
+
+Write the resolved feature specification to `{output_resolved_spec_path}`. If the sandbox blocks writes, return the complete resolved Markdown spec as your final message with no code fences.
+
+The resolved spec must be self-contained, must preserve constraints from the original spec, and must incorporate the answers without inventing additional scope.
+"#;
 
 const DECOMPOSE_FEATURE_TEMPLATE: &str = r#"# Codex Task Decomposer
 
@@ -2557,6 +3516,100 @@ This is a read-only final feature review. Do not edit `tasks.json`, `state.json`
 Write a Markdown final review report to `{output_feature_review_path}` when the sandbox allows it. If the sandbox blocks file writes, return the exact Markdown final review report as your final message with no code fences. The report must contain YAML frontmatter with `verdict: APPROVED` or `verdict: CHANGES_REQUESTED`.
 
 MVP rule: final review may report integration issues, but it must not append tasks or modify run state.
+"#;
+
+const FINAL_REVIEW_SHARD_TEMPLATE: &str = r#"# Codex Final Review Shard
+
+Current date: {date}
+Repository root: {repo_root}
+Run id: {run_id}
+Branch: {branch}
+Spec file: {spec_file}
+Review type: {review_type}
+Findings output path: {output_findings_path}
+
+This is a read-only targeted final review shard. Do not modify code, tests, docs, tasks, or state.
+
+Review only the assigned risk type. Use only the context below; do not ask for or assume unrelated files.
+
+## Resolved Specification
+{resolved_spec}
+
+## Change Map
+```json
+{change_map}
+```
+
+## Relevant Diff
+```diff
+{relevant_diff}
+```
+
+## Relevant Logs
+```text
+{relevant_logs}
+```
+
+## Relevant Files
+```text
+{relevant_files}
+```
+
+Write JSON to `{output_findings_path}` when possible. If the sandbox blocks writes, return the exact JSON as your final message with no code fences.
+
+The JSON shape is:
+
+```json
+{
+  "verdict": "APPROVED",
+  "findings": []
+}
+```
+
+`verdict` must be exactly `APPROVED` or `CHANGES_REQUESTED`. Any `MUST_FIX` finding requires `CHANGES_REQUESTED`. Each finding must contain `id`, `severity`, `title`, and `detail`; `severity` must be `MUST_FIX`, `SHOULD_FIX`, or `INFO`.
+"#;
+
+const FINAL_REVIEW_AGGREGATE_TEMPLATE: &str = r#"# Codex Final Review Aggregator
+
+Current date: {date}
+Repository root: {repo_root}
+Run id: {run_id}
+Branch: {branch}
+Spec file: {spec_file}
+Aggregate review output path: {output_review_path}
+
+This is a read-only aggregate final review. Do not modify code, tests, docs, tasks, or state.
+
+You must take the high-level view: compare the resolved spec, change map, all shard findings, public API summary, DB summary, docs summary, and verification summary.
+
+## Resolved Specification
+{resolved_spec}
+
+## Change Map
+```json
+{change_map}
+```
+
+## Shard Findings
+```json
+{shard_findings}
+```
+
+## Public API Summary
+{public_api_summary}
+
+## DB Summary
+{db_summary}
+
+## Docs Summary
+{docs_summary}
+
+## Verification Summary
+{verification_summary}
+
+Write a Markdown aggregate report to `{output_review_path}` when possible. If the sandbox blocks writes, return the exact report as your final message with no code fences. The report must contain YAML frontmatter with `verdict: APPROVED` or `verdict: CHANGES_REQUESTED`.
+
+Missing shard output, invalid shard verdict, execution failure, or any remaining `MUST_FIX` must be `CHANGES_REQUESTED`.
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3525,6 +4578,10 @@ pub struct RunState {
     pub schema_version: u64,
     #[serde(default)]
     pub tasks: Vec<TaskState>,
+    #[serde(rename = "requirementReview", default)]
+    pub requirement_review: RequirementReviewState,
+    #[serde(rename = "finalReview", default)]
+    pub final_review: FinalReviewState,
     #[serde(
         rename = "featureReviewStatus",
         default = "default_feature_review_status"
@@ -3541,6 +4598,8 @@ impl Default for RunState {
         Self {
             schema_version: default_run_state_version(),
             tasks: Vec::new(),
+            requirement_review: RequirementReviewState::default(),
+            final_review: FinalReviewState::default(),
             feature_review_status: default_feature_review_status(),
             feature_review_attempts: 0,
             extra: Map::new(),
@@ -3621,8 +4680,10 @@ pub struct StatusView {
     pub branch: String,
     pub spec_file: String,
     pub run_dir: PathBuf,
+    pub requirement_review_status: String,
     pub feature_review_status: String,
     pub feature_review_attempts: u64,
+    pub final_review_status: String,
     pub counts: BTreeMap<String, usize>,
     pub tasks: Vec<TaskStatusView>,
 }
@@ -3718,6 +4779,7 @@ pub struct RunInspectView {
 pub struct RunLocationView {
     pub run_id: String,
     pub run_dir: PathBuf,
+    pub visible_run_dir: PathBuf,
     pub location: String,
     pub archive_name: Option<String>,
     pub tasks_path: PathBuf,
@@ -4289,46 +5351,466 @@ pub fn finalize_run_in_repo(
     let _execution_lock = store.try_acquire_execution_lock(&run_id)?;
     recover_stale_running_tasks(&store, &run_id)?;
 
-    let task_file = store.read_task_file(&run_id)?;
-    let state = store.read_run_state(&run_id)?;
-    ensure_all_tasks_complete_for_finalize(&task_file, &state)?;
+    let max_rounds = context.merged.runner.max_final_review_rounds.max(1);
+    let mut message = format!("Run {run_id} final review blocked");
+    let mut exit_code = 1;
 
-    let attempt = state.feature_review_attempts + 1;
-    let run_dir = store.run_dir(&run_id)?;
-    let output_path = feature_review_output_path(&run_dir, attempt);
-    let prompt = render_review_feature_prompt(&context, &store, &run_id, &task_file, &output_path)?;
+    loop {
+        let task_file = store.read_task_file(&run_id)?;
+        let state = store.read_run_state(&run_id)?;
+        ensure_all_tasks_complete_for_finalize(&task_file, &state)?;
+        let round = state.feature_review_attempts + 1;
+        if round > max_rounds {
+            let remaining = state.final_review.remaining_must_fix.clone();
+            block_final_review(
+                &store,
+                &run_id,
+                max_rounds,
+                remaining,
+                "max_final_review_rounds reached".to_string(),
+            )?;
+            break;
+        }
 
-    store.update_run_state(&run_id, |state| {
+        let outcome = execute_final_review_round(FinalReviewRoundInput {
+            context: &context,
+            store: &store,
+            run_id: &run_id,
+            task_file: &task_file,
+            round,
+            max_rounds,
+            codex_bin: options.codex_bin.clone(),
+            no_cleanup: options.no_cleanup,
+        })?;
+
+        if outcome.verdict == ReviewVerdict::Approved && outcome.must_fix.is_empty() {
+            finish_feature_review(&store, &run_id, FeatureReviewStatus::Approved, None, None)?;
+            finalize_approved_run(&context, &store, &run_id, &task_file, options.no_cleanup)?;
+            message = if options.no_cleanup {
+                format!("Run {run_id} final review approved")
+            } else {
+                format!("Run {run_id} final review approved and archived")
+            };
+            exit_code = 0;
+            break;
+        }
+
+        if round >= max_rounds {
+            block_final_review(
+                &store,
+                &run_id,
+                max_rounds,
+                outcome.must_fix,
+                "max_final_review_rounds reached".to_string(),
+            )?;
+            message = format!("Run {run_id} final review blocked");
+            break;
+        }
+
+        let final_fix_task_id =
+            append_final_fix_task(&store, &run_id, &task_file, round, &outcome.must_fix)?;
+        record_final_fix_task(&store, &run_id, round, &final_fix_task_id)?;
+        match run_final_fix_task(
+            &context,
+            &store,
+            &run_id,
+            &final_fix_task_id,
+            options.codex_bin.clone(),
+        ) {
+            Ok(()) => continue,
+            Err(err) => {
+                let mut remaining = outcome.must_fix;
+                remaining.push(FinalReviewFinding {
+                    id: format!("final-fix-round-{round}-failed"),
+                    review_type: "final-fix".to_string(),
+                    severity: FindingSeverity::MustFix,
+                    title: "final-fix task failed".to_string(),
+                    detail: err.to_string(),
+                    source: Some(final_fix_task_id),
+                });
+                block_final_review(
+                    &store,
+                    &run_id,
+                    max_rounds,
+                    remaining,
+                    "final-fix task failed".to_string(),
+                )?;
+                message = format!("Run {run_id} final review blocked");
+                break;
+            }
+        }
+    }
+
+    Ok(SchedulerResult {
+        run_id,
+        message,
+        exit_code,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FinalReviewRoundOutcome {
+    verdict: ReviewVerdict,
+    must_fix: Vec<FinalReviewFinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ChangeMap {
+    #[serde(rename = "runId")]
+    run_id: String,
+    branch: String,
+    #[serde(rename = "specFile")]
+    spec_file: String,
+    files: Vec<ChangedFile>,
+    #[serde(rename = "publicApiSummary")]
+    public_api_summary: String,
+    #[serde(rename = "dbSummary")]
+    db_summary: String,
+    #[serde(rename = "docsSummary")]
+    docs_summary: String,
+    #[serde(rename = "verificationSummary")]
+    verification_summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ChangedFile {
+    path: String,
+    #[serde(rename = "changeKind")]
+    change_kind: String,
+    #[serde(rename = "riskTypes")]
+    risk_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct ShardReviewOutput {
+    verdict: ReviewVerdict,
+    #[serde(default)]
+    findings: Vec<ShardFindingInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct ShardFindingInput {
+    id: String,
+    severity: FindingSeverity,
+    title: String,
+    detail: String,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+struct FinalReviewRoundInput<'a> {
+    context: &'a ConfigContext,
+    store: &'a RunStore,
+    run_id: &'a str,
+    task_file: &'a TaskFile,
+    round: u64,
+    max_rounds: u64,
+    codex_bin: Option<PathBuf>,
+    no_cleanup: bool,
+}
+
+fn execute_final_review_round(
+    input: FinalReviewRoundInput<'_>,
+) -> std::result::Result<FinalReviewRoundOutcome, AppError> {
+    let FinalReviewRoundInput {
+        context,
+        store,
+        run_id,
+        task_file,
+        round,
+        max_rounds,
+        codex_bin,
+        no_cleanup,
+    } = input;
+    let run_dir = store.run_dir(run_id)?;
+    let round_dir = run_dir
+        .join("output/final-review")
+        .join(format!("round-{round}"));
+    let visible_round_dir = project_task_run_dir(&context.repo_root, run_id)
+        .join("final-review")
+        .join(format!("round-{round}"));
+    fs::create_dir_all(&round_dir)
+        .map_err(|err| AppError::Io(format!("failed to create {}: {err}", round_dir.display())))?;
+    fs::create_dir_all(&visible_round_dir).map_err(|err| {
+        AppError::Io(format!(
+            "failed to create {}: {err}",
+            visible_round_dir.display()
+        ))
+    })?;
+
+    let change_map = build_change_map(context, store, run_id, task_file)?;
+    let change_map_path = round_dir.join("change-map.json");
+    let visible_change_map_path = visible_round_dir.join("change-map.json");
+    write_json_file(&change_map_path, &change_map)?;
+    write_json_file(&visible_change_map_path, &change_map)?;
+
+    let review_plan = build_review_plan(&change_map);
+    let review_plan_path = round_dir.join("review-plan.md");
+    let visible_review_plan_path = visible_round_dir.join("review-plan.md");
+    write_text_file(&review_plan_path, &review_plan)?;
+    write_text_file(&visible_review_plan_path, &review_plan)?;
+
+    let started_at = current_timestamp()?;
+    store.update_run_state(run_id, |state| {
         state.feature_review_status = FeatureReviewStatus::Running;
-        state.feature_review_attempts = attempt;
+        state.feature_review_attempts = round;
+        state.final_review.status = FeatureReviewStatus::Running;
+        state.final_review.max_rounds = max_rounds;
+        state.final_review.change_map_path = Some(change_map_path.display().to_string());
+        state.final_review.review_plan_path = Some(review_plan_path.display().to_string());
+        state.final_review.last_error = None;
         state.extra.insert(
             "featureReviewOutput".to_string(),
-            Value::String(output_path.display().to_string()),
+            Value::String(round_dir.display().to_string()),
         );
         state.extra.remove("featureReviewLastError");
         state.extra.remove("featureReviewLastLog");
-        if options.no_cleanup {
+        if no_cleanup {
             state
                 .extra
                 .insert("featureReviewNoCleanup".to_string(), Value::Bool(true));
         }
+        state.final_review.rounds.push(FinalReviewRoundState {
+            round,
+            status: FeatureReviewStatus::Running,
+            started_at: Some(started_at.clone()),
+            finished_at: None,
+            change_map_path: Some(change_map_path.display().to_string()),
+            review_plan_path: Some(review_plan_path.display().to_string()),
+            findings_path: None,
+            aggregate_output: None,
+            final_fix_task_id: None,
+            shards: Vec::new(),
+            remaining_must_fix: Vec::new(),
+        });
         Ok(())
     })?;
 
+    append_event_log(
+        &run_dir,
+        &format!(
+            "final review round {round} started; change_map={}, review_plan={}",
+            change_map_path.display(),
+            review_plan_path.display()
+        ),
+    )?;
+
+    let change_map_json = serde_json::to_string_pretty(&change_map)
+        .map_err(|err| AppError::Runtime(format!("failed to encode change map: {err}")))?;
+    let feature_diff =
+        feature_branch_diff(&context.repo_root, &context.merged.project.default_branch)?;
+    let resolved_spec = read_final_review_spec(context, task_file)?;
+    let mut all_findings = Vec::new();
+    let mut shard_states = Vec::new();
+
+    for review_type in FINAL_REVIEW_TYPES {
+        let shard = execute_final_review_shard(FinalReviewShardInput {
+            context,
+            store,
+            run_id,
+            task_file,
+            round,
+            review_type,
+            resolved_spec: &resolved_spec,
+            change_map: &change_map,
+            change_map_json: &change_map_json,
+            feature_diff: &feature_diff,
+            codex_bin: codex_bin.clone(),
+        })?;
+        all_findings.extend(shard.findings.clone());
+        shard_states.push(shard.state);
+    }
+
+    let findings_path = round_dir.join("findings.json");
+    let visible_findings_path = visible_round_dir.join("findings.json");
+    write_json_file(&findings_path, &all_findings)?;
+    write_json_file(&visible_findings_path, &all_findings)?;
+
+    let aggregate_output_path = round_dir.join("aggregate-review.md");
+    let aggregate = match execute_final_review_aggregate(FinalReviewAggregateInput {
+        context,
+        store,
+        run_id,
+        task_file,
+        round,
+        resolved_spec: &resolved_spec,
+        change_map: &change_map,
+        change_map_json: &change_map_json,
+        findings: &all_findings,
+        output_path: &aggregate_output_path,
+        codex_bin,
+    }) {
+        Ok(verdict) => verdict,
+        Err(err) => {
+            all_findings.push(synthetic_final_review_finding(
+                round,
+                "aggregate",
+                "aggregate review failed",
+                &err.to_string(),
+                Some(aggregate_output_path.display().to_string()),
+            ));
+            ReviewVerdict::ChangesRequested
+        }
+    };
+    write_json_file(&findings_path, &all_findings)?;
+    write_json_file(&visible_findings_path, &all_findings)?;
+    if let Ok(text) = fs::read_to_string(&aggregate_output_path) {
+        write_text_file(&visible_round_dir.join("aggregate-review.md"), &text)?;
+    }
+
+    let mut must_fix = all_findings
+        .iter()
+        .filter(|finding| finding.severity == FindingSeverity::MustFix)
+        .cloned()
+        .collect::<Vec<_>>();
+    if aggregate == ReviewVerdict::ChangesRequested && must_fix.is_empty() {
+        must_fix.push(FinalReviewFinding {
+            id: format!("aggregate-round-{round}-changes-requested"),
+            review_type: "aggregate".to_string(),
+            severity: FindingSeverity::MustFix,
+            title: "aggregate review requested changes".to_string(),
+            detail: "Aggregate review returned CHANGES_REQUESTED without a shard MUST_FIX."
+                .to_string(),
+            source: Some(aggregate_output_path.display().to_string()),
+        });
+    }
+
+    let verdict = if must_fix.is_empty() && aggregate == ReviewVerdict::Approved {
+        ReviewVerdict::Approved
+    } else {
+        ReviewVerdict::ChangesRequested
+    };
+    let status = if verdict == ReviewVerdict::Approved {
+        FeatureReviewStatus::Approved
+    } else {
+        FeatureReviewStatus::ChangesRequested
+    };
+    let finished_at = current_timestamp()?;
+    store.update_run_state(run_id, |state| {
+        state.feature_review_status = status;
+        state.final_review.status = status;
+        state.final_review.findings_path = Some(findings_path.display().to_string());
+        state.final_review.remaining_must_fix = must_fix.clone();
+        if let Some(round_state) = state
+            .final_review
+            .rounds
+            .iter_mut()
+            .rev()
+            .find(|candidate| candidate.round == round)
+        {
+            round_state.status = status;
+            round_state.finished_at = Some(finished_at.clone());
+            round_state.findings_path = Some(findings_path.display().to_string());
+            round_state.aggregate_output = Some(aggregate_output_path.display().to_string());
+            round_state.shards = shard_states;
+            round_state.remaining_must_fix = must_fix.clone();
+        }
+        if must_fix.is_empty() {
+            state.extra.remove("featureReviewLastError");
+            state.extra.remove("featureReviewLastLog");
+        } else {
+            state.extra.insert(
+                "featureReviewLastError".to_string(),
+                Value::String(format!("{} MUST_FIX finding(s)", must_fix.len())),
+            );
+            state.extra.insert(
+                "featureReviewLastLog".to_string(),
+                Value::String(findings_path.display().to_string()),
+            );
+        }
+        Ok(())
+    })?;
+
+    append_event_log(
+        &run_dir,
+        &format!(
+            "final review round {round} finished; verdict={}, must_fix={}",
+            verdict.as_str(),
+            must_fix.len()
+        ),
+    )?;
+
+    Ok(FinalReviewRoundOutcome { verdict, must_fix })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FinalReviewShardOutcome {
+    state: FinalReviewShardState,
+    findings: Vec<FinalReviewFinding>,
+}
+
+struct FinalReviewShardInput<'a> {
+    context: &'a ConfigContext,
+    store: &'a RunStore,
+    run_id: &'a str,
+    task_file: &'a TaskFile,
+    round: u64,
+    review_type: &'a str,
+    resolved_spec: &'a str,
+    change_map: &'a ChangeMap,
+    change_map_json: &'a str,
+    feature_diff: &'a str,
+    codex_bin: Option<PathBuf>,
+}
+
+fn execute_final_review_shard(
+    input: FinalReviewShardInput<'_>,
+) -> std::result::Result<FinalReviewShardOutcome, AppError> {
+    let FinalReviewShardInput {
+        context,
+        store,
+        run_id,
+        task_file,
+        round,
+        review_type,
+        resolved_spec,
+        change_map,
+        change_map_json,
+        feature_diff,
+        codex_bin,
+    } = input;
+    let run_dir = store.run_dir(run_id)?;
+    let safe_type = normalized_verification_name(review_type);
+    let output_path = run_dir
+        .join("output/final-review")
+        .join(format!("round-{round}"))
+        .join(format!("{safe_type}.findings.json"));
+    let relevant_paths = change_map
+        .files
+        .iter()
+        .filter(|file| file.risk_types.iter().any(|risk| risk == review_type))
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    let relevant_diff = filter_diff_for_paths(feature_diff, &relevant_paths);
+    let relevant_logs = relevant_logs_for_review_type(store, run_id, review_type)?;
+    let relevant_files = read_relevant_files(&context.repo_root, &relevant_paths)?;
+    let prompt = render_final_review_shard_prompt(FinalReviewShardRender {
+        context,
+        store,
+        run_id,
+        task_file,
+        review_type,
+        resolved_spec,
+        change_map_json,
+        relevant_diff: &relevant_diff,
+        relevant_logs: &relevant_logs,
+        relevant_files: &relevant_files,
+        output_path: &output_path,
+    })?;
     let request = CodexRunRequest {
         prompt,
         prompt_path: run_dir
             .join("prompts")
-            .join(format!("feature-review.{attempt}.md")),
+            .join(format!("final-review.round-{round}.{safe_type}.md")),
         stdout_log_path: run_dir
             .join("logs")
-            .join(format!("feature-review.{attempt}.stdout.log")),
+            .join(format!("final-review.round-{round}.{safe_type}.stdout.log")),
         stderr_log_path: run_dir
             .join("logs")
-            .join(format!("feature-review.{attempt}.stderr.log")),
-        last_message_path: run_dir
-            .join("logs")
-            .join(format!("feature-review.{attempt}.last-message.md")),
+            .join(format!("final-review.round-{round}.{safe_type}.stderr.log")),
+        last_message_path: run_dir.join("logs").join(format!(
+            "final-review.round-{round}.{safe_type}.last-message.md"
+        )),
         required_output_path: Some(output_path.clone()),
         sandbox: context.merged.runner.review_sandbox.clone(),
         approval: context.merged.runner.approval.clone(),
@@ -4338,60 +5820,888 @@ pub fn finalize_run_in_repo(
         timeout_seconds: context.merged.runner.default_review_timeout_seconds,
     };
 
-    let result = build_executor(&context, options.codex_bin).execute(&request);
-    let (message, exit_code) = match result {
-        Ok(_) => match parse_final_review_output_file(&output_path) {
-            Ok(ReviewVerdict::Approved) => {
-                finish_feature_review(&store, &run_id, FeatureReviewStatus::Approved, None, None)?;
-                finalize_approved_run(&context, &store, &run_id, &task_file, options.no_cleanup)?;
-                (
-                    if options.no_cleanup {
-                        format!("Run {run_id} final review approved")
-                    } else {
-                        format!("Run {run_id} final review approved and archived")
+    match build_executor(context, codex_bin).execute(&request) {
+        Ok(output) => match parse_final_review_shard_output(&output_path, review_type) {
+            Ok((verdict, findings)) => {
+                let findings_count = findings.len();
+                Ok(FinalReviewShardOutcome {
+                    state: FinalReviewShardState {
+                        review_type: review_type.to_string(),
+                        status: if verdict == ReviewVerdict::Approved {
+                            FeatureReviewStatus::Approved
+                        } else {
+                            FeatureReviewStatus::ChangesRequested
+                        },
+                        verdict: Some(verdict),
+                        output: Some(output_path.display().to_string()),
+                        stdout_log: Some(output.stdout_log_path.display().to_string()),
+                        stderr_log: Some(output.stderr_log_path.display().to_string()),
+                        last_message: Some(output.last_message_path.display().to_string()),
+                        findings_count,
+                        last_error: None,
                     },
-                    0,
-                )
-            }
-            Ok(ReviewVerdict::ChangesRequested) => {
-                finish_feature_review(
-                    &store,
-                    &run_id,
-                    FeatureReviewStatus::ChangesRequested,
-                    None,
-                    Some(output_path.display().to_string()),
-                )?;
-                (format!("Run {run_id} final review requested changes"), 1)
+                    findings,
+                })
             }
             Err(err) => {
-                finish_feature_review(
-                    &store,
-                    &run_id,
-                    FeatureReviewStatus::Failed,
-                    Some(err),
+                let finding = synthetic_final_review_finding(
+                    round,
+                    review_type,
+                    "invalid shard output",
+                    &err,
                     Some(output_path.display().to_string()),
-                )?;
-                (format!("Run {run_id} final review failed"), 1)
+                );
+                Ok(FinalReviewShardOutcome {
+                    state: FinalReviewShardState {
+                        review_type: review_type.to_string(),
+                        status: FeatureReviewStatus::Failed,
+                        verdict: None,
+                        output: Some(output_path.display().to_string()),
+                        stdout_log: Some(output.stdout_log_path.display().to_string()),
+                        stderr_log: Some(output.stderr_log_path.display().to_string()),
+                        last_message: Some(output.last_message_path.display().to_string()),
+                        findings_count: 1,
+                        last_error: Some(err),
+                    },
+                    findings: vec![finding],
+                })
             }
         },
         Err(err) => {
             let err = *err;
-            finish_feature_review(
-                &store,
-                &run_id,
-                FeatureReviewStatus::Failed,
-                Some(err.message),
+            let finding = synthetic_final_review_finding(
+                round,
+                review_type,
+                "shard execution failed",
+                &err.message,
                 Some(err.stderr_log_path.display().to_string()),
-            )?;
-            (format!("Run {run_id} final review failed"), 1)
+            );
+            Ok(FinalReviewShardOutcome {
+                state: FinalReviewShardState {
+                    review_type: review_type.to_string(),
+                    status: FeatureReviewStatus::Failed,
+                    verdict: None,
+                    output: Some(output_path.display().to_string()),
+                    stdout_log: Some(err.stdout_log_path.display().to_string()),
+                    stderr_log: Some(err.stderr_log_path.display().to_string()),
+                    last_message: Some(err.last_message_path.display().to_string()),
+                    findings_count: 1,
+                    last_error: Some(err.message),
+                },
+                findings: vec![finding],
+            })
         }
-    };
+    }
+}
 
-    Ok(SchedulerResult {
+struct FinalReviewAggregateInput<'a> {
+    context: &'a ConfigContext,
+    store: &'a RunStore,
+    run_id: &'a str,
+    task_file: &'a TaskFile,
+    round: u64,
+    resolved_spec: &'a str,
+    change_map: &'a ChangeMap,
+    change_map_json: &'a str,
+    findings: &'a [FinalReviewFinding],
+    output_path: &'a Path,
+    codex_bin: Option<PathBuf>,
+}
+
+fn execute_final_review_aggregate(
+    input: FinalReviewAggregateInput<'_>,
+) -> std::result::Result<ReviewVerdict, AppError> {
+    let FinalReviewAggregateInput {
+        context,
+        store,
         run_id,
-        message,
-        exit_code,
+        task_file,
+        round,
+        resolved_spec,
+        change_map,
+        change_map_json,
+        findings,
+        output_path,
+        codex_bin,
+    } = input;
+    let run_dir = store.run_dir(run_id)?;
+    let findings_json = serde_json::to_string_pretty(findings)
+        .map_err(|err| AppError::Runtime(format!("failed to encode findings: {err}")))?;
+    let prompt = render_final_review_aggregate_prompt(FinalReviewAggregateRender {
+        context,
+        store,
+        run_id,
+        task_file,
+        resolved_spec,
+        change_map_json,
+        shard_findings: &findings_json,
+        public_api_summary: &change_map.public_api_summary,
+        db_summary: &change_map.db_summary,
+        docs_summary: &change_map.docs_summary,
+        verification_summary: &change_map.verification_summary,
+        output_path,
+    })?;
+    let request = CodexRunRequest {
+        prompt,
+        prompt_path: run_dir
+            .join("prompts")
+            .join(format!("final-review.round-{round}.aggregate.md")),
+        stdout_log_path: run_dir
+            .join("logs")
+            .join(format!("final-review.round-{round}.aggregate.stdout.log")),
+        stderr_log_path: run_dir
+            .join("logs")
+            .join(format!("final-review.round-{round}.aggregate.stderr.log")),
+        last_message_path: run_dir.join("logs").join(format!(
+            "final-review.round-{round}.aggregate.last-message.md"
+        )),
+        required_output_path: Some(output_path.to_path_buf()),
+        sandbox: context.merged.runner.review_sandbox.clone(),
+        approval: context.merged.runner.approval.clone(),
+        model: context.merged.runner.model.clone(),
+        reasoning_effort: context.merged.runner.reasoning_effort.clone(),
+        search: Some(context.merged.runner.search),
+        timeout_seconds: context.merged.runner.default_review_timeout_seconds,
+    };
+    match build_executor(context, codex_bin).execute(&request) {
+        Ok(_) => parse_final_review_output_file(output_path).map_err(|err| {
+            AppError::Runtime(format!(
+                "invalid aggregate final review output: {err}; output={}",
+                output_path.display()
+            ))
+        }),
+        Err(err) => {
+            let err = *err;
+            Err(AppError::Runtime(format!(
+                "{}; logs: stdout={}, stderr={}, last={}",
+                err.message,
+                err.stdout_log_path.display(),
+                err.stderr_log_path.display(),
+                err.last_message_path.display()
+            )))
+        }
+    }
+}
+
+fn build_change_map(
+    context: &ConfigContext,
+    store: &RunStore,
+    run_id: &str,
+    task_file: &TaskFile,
+) -> std::result::Result<ChangeMap, AppError> {
+    let mut files = BTreeMap::<String, String>::new();
+    if git_branch_exists(&context.repo_root, &context.merged.project.default_branch)? {
+        let range = format!("{}...HEAD", context.merged.project.default_branch);
+        for (status, path) in
+            git_name_status(&context.repo_root, &["diff", "--name-status", &range, "--"])?
+        {
+            files.insert(path, status);
+        }
+    }
+    for (status, path) in git_name_status(
+        &context.repo_root,
+        &["diff", "--cached", "--name-status", "--"],
+    )? {
+        files.insert(path, status);
+    }
+    for (status, path) in git_name_status(&context.repo_root, &["diff", "--name-status", "--"])? {
+        files.insert(path, status);
+    }
+    for entry in git_status_entries(&context.repo_root)? {
+        files.entry(entry.path).or_insert_with(|| "WT".to_string());
+    }
+
+    let changed_files = files
+        .into_iter()
+        .map(|(path, change_kind)| ChangedFile {
+            risk_types: risk_types_for_path(&path),
+            path,
+            change_kind,
+        })
+        .collect::<Vec<_>>();
+    let public_api_summary = summarize_paths(
+        &changed_files,
+        is_public_api_path,
+        "No public API files changed.",
+    );
+    let db_summary = summarize_paths(
+        &changed_files,
+        is_database_path,
+        "No database or migration files changed.",
+    );
+    let docs_summary = summarize_paths(
+        &changed_files,
+        is_docs_contract_path,
+        "No docs or contract files changed.",
+    );
+    let verification_summary = final_review_verification_summary(store, run_id, task_file)?;
+
+    Ok(ChangeMap {
+        run_id: task_file.run_id.clone(),
+        branch: task_file.branch.clone(),
+        spec_file: task_file.spec_file.clone(),
+        files: changed_files,
+        public_api_summary,
+        db_summary,
+        docs_summary,
+        verification_summary,
     })
+}
+
+fn git_name_status(
+    repo_root: &Path,
+    args: &[&str],
+) -> std::result::Result<Vec<(String, String)>, AppError> {
+    let output = git_output(repo_root, args)?;
+    let mut out = Vec::new();
+    for line in output.lines() {
+        let mut parts = line.split('\t');
+        let Some(status) = parts.next() else {
+            continue;
+        };
+        let Some(path) = parts.next_back().or_else(|| parts.next()) else {
+            continue;
+        };
+        if !path.trim().is_empty() {
+            out.push((status.to_string(), path.to_string()));
+        }
+    }
+    Ok(out)
+}
+
+fn risk_types_for_path(path: &str) -> Vec<String> {
+    let mut risks = BTreeSet::new();
+    risks.insert("code-defect".to_string());
+    risks.insert("architecture/integration".to_string());
+    if is_public_api_path(path) {
+        risks.insert("backward-compatibility".to_string());
+        risks.insert("docs-contract".to_string());
+        risks.insert("business-scenario".to_string());
+    }
+    if is_database_path(path) {
+        risks.insert("data-migration".to_string());
+        risks.insert("backward-compatibility".to_string());
+    }
+    if is_test_path(path) {
+        risks.insert("test-coverage".to_string());
+    }
+    if is_docs_contract_path(path) {
+        risks.insert("docs-contract".to_string());
+    }
+    if is_security_sensitive_path(path) {
+        risks.insert("security".to_string());
+    }
+    if is_performance_sensitive_path(path) {
+        risks.insert("performance".to_string());
+    }
+    risks.into_iter().collect()
+}
+
+fn is_public_api_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("controller")
+        || lower.contains("/api/")
+        || lower.contains("openapi")
+        || lower.contains("proto")
+        || lower.contains("route")
+}
+
+fn is_database_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("migration")
+        || lower.contains("flyway")
+        || lower.contains("/db/")
+        || lower.contains("schema")
+}
+
+fn is_test_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("/test") || lower.contains("_test") || lower.contains(".test.")
+}
+
+fn is_docs_contract_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.starts_with("docs/")
+        || lower.contains("/docs/")
+        || lower.ends_with(".md")
+        || lower.contains("openapi")
+}
+
+fn is_security_sensitive_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("auth")
+        || lower.contains("security")
+        || lower.contains("permission")
+        || lower.contains("token")
+        || lower.contains("password")
+}
+
+fn is_performance_sensitive_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("cache")
+        || lower.contains("query")
+        || lower.contains("batch")
+        || lower.contains("index")
+        || lower.contains("performance")
+}
+
+fn summarize_paths<F>(files: &[ChangedFile], predicate: F, empty: &str) -> String
+where
+    F: Fn(&str) -> bool,
+{
+    let paths = files
+        .iter()
+        .filter(|file| predicate(&file.path))
+        .map(|file| format!("- {} ({})", file.path, file.change_kind))
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        empty.to_string()
+    } else {
+        paths.join("\n")
+    }
+}
+
+fn final_review_verification_summary(
+    store: &RunStore,
+    run_id: &str,
+    task_file: &TaskFile,
+) -> std::result::Result<String, AppError> {
+    let state = store.read_run_state(run_id)?;
+    let state_by_id = normalized_state_map(task_file, &state)?;
+    let mut lines = Vec::new();
+    for task in &task_file.tasks {
+        if let Some(task_state) = state_by_id.get(task.id.as_str()) {
+            let logs = task_state
+                .extra
+                .get("verificationLogs")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_else(|| "(none)".to_string());
+            lines.push(format!(
+                "- {}: status={}, phase={}, verificationLogs={}",
+                task.id,
+                task_state.status.as_str(),
+                task_state.phase.map(TaskPhase::as_str).unwrap_or("-"),
+                logs
+            ));
+        }
+    }
+    Ok(if lines.is_empty() {
+        "No task verification state found.".to_string()
+    } else {
+        lines.join("\n")
+    })
+}
+
+fn build_review_plan(change_map: &ChangeMap) -> String {
+    let mut out = String::new();
+    out.push_str("# Final Review Plan\n\n");
+    out.push_str(&format!("Run: {}\n\n", change_map.run_id));
+    for review_type in FINAL_REVIEW_TYPES {
+        let files = change_map
+            .files
+            .iter()
+            .filter(|file| file.risk_types.iter().any(|risk| risk == review_type))
+            .map(|file| format!("- {} ({})", file.path, file.change_kind))
+            .collect::<Vec<_>>();
+        out.push_str(&format!("## {review_type}\n\n"));
+        if files.is_empty() {
+            out.push_str(
+                "- No directly mapped files; review resolved spec and change-map summary.\n\n",
+            );
+        } else {
+            out.push_str(&files.join("\n"));
+            out.push_str("\n\n");
+        }
+    }
+    out
+}
+
+fn write_json_file<T: Serialize>(path: &Path, value: &T) -> std::result::Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| AppError::Io(format!("failed to create {}: {err}", parent.display())))?;
+    }
+    let text = serde_json::to_string_pretty(value)
+        .map_err(|err| AppError::Runtime(format!("failed to encode JSON: {err}")))?;
+    fs::write(path, format!("{text}\n"))
+        .map_err(|err| AppError::Io(format!("failed to write {}: {err}", path.display())))
+}
+
+fn write_text_file(path: &Path, text: &str) -> std::result::Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| AppError::Io(format!("failed to create {}: {err}", parent.display())))?;
+    }
+    fs::write(path, text)
+        .map_err(|err| AppError::Io(format!("failed to write {}: {err}", path.display())))
+}
+
+fn read_final_review_spec(
+    context: &ConfigContext,
+    task_file: &TaskFile,
+) -> std::result::Result<String, AppError> {
+    let spec = SpecDocument::read(&context.repo_root.join(&task_file.spec_file))?;
+    Ok(spec.body)
+}
+
+struct FinalReviewShardRender<'a> {
+    context: &'a ConfigContext,
+    store: &'a RunStore,
+    run_id: &'a str,
+    task_file: &'a TaskFile,
+    review_type: &'a str,
+    resolved_spec: &'a str,
+    change_map_json: &'a str,
+    relevant_diff: &'a str,
+    relevant_logs: &'a str,
+    relevant_files: &'a str,
+    output_path: &'a Path,
+}
+
+fn render_final_review_shard_prompt(
+    input: FinalReviewShardRender<'_>,
+) -> std::result::Result<String, AppError> {
+    let FinalReviewShardRender {
+        context,
+        store,
+        run_id,
+        task_file,
+        review_type,
+        resolved_spec,
+        change_map_json,
+        relevant_diff,
+        relevant_logs,
+        relevant_files,
+        output_path,
+    } = input;
+    let input = FinalReviewShardPromptInput {
+        common: common_prompt_variables(context, store, run_id)?,
+        run_id: task_file.run_id.clone(),
+        branch: task_file.branch.clone(),
+        spec_file: task_file.spec_file.clone(),
+        resolved_spec: resolved_spec.to_string(),
+        review_type: review_type.to_string(),
+        change_map: change_map_json.to_string(),
+        relevant_diff: relevant_diff.to_string(),
+        relevant_logs: relevant_logs.to_string(),
+        relevant_files: relevant_files.to_string(),
+        output_findings_path: output_path.display().to_string(),
+    };
+    let template = load_prompt_template(context, PromptTemplateKind::FinalReviewShard)
+        .map_err(|err| AppError::Config(err.to_string()))?;
+    template
+        .render(&input)
+        .map_err(|err| AppError::Config(err.to_string()))
+}
+
+struct FinalReviewAggregateRender<'a> {
+    context: &'a ConfigContext,
+    store: &'a RunStore,
+    run_id: &'a str,
+    task_file: &'a TaskFile,
+    resolved_spec: &'a str,
+    change_map_json: &'a str,
+    shard_findings: &'a str,
+    public_api_summary: &'a str,
+    db_summary: &'a str,
+    docs_summary: &'a str,
+    verification_summary: &'a str,
+    output_path: &'a Path,
+}
+
+fn render_final_review_aggregate_prompt(
+    input: FinalReviewAggregateRender<'_>,
+) -> std::result::Result<String, AppError> {
+    let FinalReviewAggregateRender {
+        context,
+        store,
+        run_id,
+        task_file,
+        resolved_spec,
+        change_map_json,
+        shard_findings,
+        public_api_summary,
+        db_summary,
+        docs_summary,
+        verification_summary,
+        output_path,
+    } = input;
+    let input = FinalReviewAggregatePromptInput {
+        common: common_prompt_variables(context, store, run_id)?,
+        run_id: task_file.run_id.clone(),
+        branch: task_file.branch.clone(),
+        spec_file: task_file.spec_file.clone(),
+        resolved_spec: resolved_spec.to_string(),
+        change_map: change_map_json.to_string(),
+        shard_findings: shard_findings.to_string(),
+        public_api_summary: public_api_summary.to_string(),
+        db_summary: db_summary.to_string(),
+        docs_summary: docs_summary.to_string(),
+        verification_summary: verification_summary.to_string(),
+        output_review_path: output_path.display().to_string(),
+    };
+    let template = load_prompt_template(context, PromptTemplateKind::FinalReviewAggregate)
+        .map_err(|err| AppError::Config(err.to_string()))?;
+    template
+        .render(&input)
+        .map_err(|err| AppError::Config(err.to_string()))
+}
+
+fn relevant_logs_for_review_type(
+    store: &RunStore,
+    run_id: &str,
+    review_type: &str,
+) -> std::result::Result<String, AppError> {
+    if review_type != "test-coverage" {
+        return Ok("(no relevant logs)".to_string());
+    }
+    let logs_dir = store.run_dir(run_id)?.join("logs");
+    let files = discover_log_files(&logs_dir, None, Some("verify"))?;
+    if files.is_empty() {
+        return Ok("(no verification logs)".to_string());
+    }
+    let mut out = String::new();
+    for file in files.into_iter().take(5) {
+        out.push_str(&format!("== {} ==\n", file.name));
+        out.push_str(&read_last_lines(&file.path, 80)?);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
+fn read_relevant_files(
+    repo_root: &Path,
+    paths: &[String],
+) -> std::result::Result<String, AppError> {
+    if paths.is_empty() {
+        return Ok("(no directly relevant files)".to_string());
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for path in paths.iter().take(8) {
+        let full = repo_root.join(path);
+        if !full.is_file() {
+            continue;
+        }
+        let mut text = fs::read_to_string(&full).unwrap_or_default();
+        if text.len() > 4000 {
+            text.truncate(4000);
+            text.push_str("\n... truncated ...\n");
+        }
+        used += text.len();
+        if used > 24000 {
+            out.push_str("\n... file context limit reached ...\n");
+            break;
+        }
+        out.push_str(&format!("== {path} ==\n{text}\n"));
+    }
+    Ok(if out.trim().is_empty() {
+        "(no readable relevant files)".to_string()
+    } else {
+        out
+    })
+}
+
+fn filter_diff_for_paths(diff: &str, paths: &[String]) -> String {
+    if paths.is_empty() || diff.trim().is_empty() {
+        return "(no relevant diff)".to_string();
+    }
+    let wanted = paths.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let mut out = Vec::new();
+    let mut current = Vec::new();
+    let mut include_current = false;
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") || line.starts_with("## ") {
+            if include_current && !current.is_empty() {
+                out.push(current.join("\n"));
+            }
+            current.clear();
+            include_current = line.starts_with("## ");
+        }
+        if line.starts_with("diff --git ") {
+            include_current = diff_header_matches_paths(line, &wanted);
+        }
+        current.push(line);
+    }
+    if include_current && !current.is_empty() {
+        out.push(current.join("\n"));
+    }
+    if out.is_empty() {
+        "(no relevant diff)".to_string()
+    } else {
+        out.join("\n")
+    }
+}
+
+fn diff_header_matches_paths(line: &str, wanted: &BTreeSet<&str>) -> bool {
+    wanted.iter().any(|path| {
+        line.contains(&format!(" a/{path} "))
+            || line.contains(&format!(" b/{path}"))
+            || line.ends_with(&format!(" b/{path}"))
+    })
+}
+
+fn parse_final_review_shard_output(
+    path: &Path,
+    review_type: &str,
+) -> std::result::Result<(ReviewVerdict, Vec<FinalReviewFinding>), String> {
+    let raw = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read shard output {}: {err}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Err("shard output is empty".to_string());
+    }
+    let parsed = serde_json::from_str::<ShardReviewOutput>(&raw)
+        .map_err(|err| format!("invalid shard findings JSON: {err}"))?;
+    let mut findings = Vec::new();
+    for (index, finding) in parsed.findings.into_iter().enumerate() {
+        if finding.id.trim().is_empty() {
+            return Err(format!("finding at index {index} has empty id"));
+        }
+        if finding.title.trim().is_empty() {
+            return Err(format!("finding {} has empty title", finding.id));
+        }
+        if finding.detail.trim().is_empty() {
+            return Err(format!("finding {} has empty detail", finding.id));
+        }
+        findings.push(FinalReviewFinding {
+            id: finding.id,
+            review_type: review_type.to_string(),
+            severity: finding.severity,
+            title: finding.title,
+            detail: finding.detail,
+            source: finding.source,
+        });
+    }
+    if parsed.verdict == ReviewVerdict::Approved
+        && findings
+            .iter()
+            .any(|finding| finding.severity == FindingSeverity::MustFix)
+    {
+        return Err("APPROVED shard contains MUST_FIX findings".to_string());
+    }
+    if parsed.verdict == ReviewVerdict::ChangesRequested
+        && findings
+            .iter()
+            .all(|finding| finding.severity != FindingSeverity::MustFix)
+    {
+        findings.push(FinalReviewFinding {
+            id: format!(
+                "{}-changes-requested-without-must-fix",
+                normalized_verification_name(review_type)
+            ),
+            review_type: review_type.to_string(),
+            severity: FindingSeverity::MustFix,
+            title: "shard requested changes without MUST_FIX".to_string(),
+            detail: "CHANGES_REQUESTED is blocking; shard did not provide a MUST_FIX finding."
+                .to_string(),
+            source: Some(path.display().to_string()),
+        });
+    }
+    Ok((parsed.verdict, findings))
+}
+
+fn synthetic_final_review_finding(
+    round: u64,
+    review_type: &str,
+    title: &str,
+    detail: &str,
+    source: Option<String>,
+) -> FinalReviewFinding {
+    FinalReviewFinding {
+        id: format!(
+            "round-{round}-{}-{}",
+            normalized_verification_name(review_type),
+            normalized_verification_name(title)
+        ),
+        review_type: review_type.to_string(),
+        severity: FindingSeverity::MustFix,
+        title: title.to_string(),
+        detail: detail.to_string(),
+        source,
+    }
+}
+
+fn block_final_review(
+    store: &RunStore,
+    run_id: &str,
+    max_rounds: u64,
+    remaining: Vec<FinalReviewFinding>,
+    reason: String,
+) -> std::result::Result<(), AppError> {
+    let run_dir = store.run_dir(run_id)?;
+    let blocked_path = run_dir.join("output/final-review/blocked-findings.json");
+    write_json_file(&blocked_path, &remaining)?;
+    store.update_run_state(run_id, |state| {
+        state.feature_review_status = FeatureReviewStatus::Blocked;
+        state.final_review.status = FeatureReviewStatus::Blocked;
+        state.final_review.max_rounds = max_rounds;
+        state.final_review.remaining_must_fix = remaining.clone();
+        state.final_review.findings_path = Some(blocked_path.display().to_string());
+        state.final_review.last_error = Some(reason.clone());
+        state.extra.insert(
+            "featureReviewLastError".to_string(),
+            Value::String(format!("{reason}; remaining MUST_FIX={}", remaining.len())),
+        );
+        state.extra.insert(
+            "featureReviewLastLog".to_string(),
+            Value::String(blocked_path.display().to_string()),
+        );
+        if let Some(round_state) = state.final_review.rounds.last_mut() {
+            round_state.status = FeatureReviewStatus::Blocked;
+            round_state.remaining_must_fix = remaining;
+        }
+        Ok(())
+    })?;
+    append_event_log(
+        &run_dir,
+        &format!(
+            "final review blocked: {}; remaining MUST_FIX written to {}",
+            reason,
+            blocked_path.display()
+        ),
+    )
+}
+
+fn append_final_fix_task(
+    store: &RunStore,
+    run_id: &str,
+    task_file: &TaskFile,
+    round: u64,
+    findings: &[FinalReviewFinding],
+) -> std::result::Result<String, AppError> {
+    let task_id = format!("final-fix-round-{round}");
+    let mut next = task_file.clone();
+    next.tasks.retain(|task| task.id != task_id);
+    let priority = next
+        .tasks
+        .iter()
+        .map(|task| task.priority)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let findings_json = serde_json::to_string_pretty(findings)
+        .map_err(|err| AppError::Runtime(format!("failed to encode findings: {err}")))?;
+    next.tasks.push(Task {
+        id: task_id.clone(),
+        priority,
+        group: "final-review".to_string(),
+        title: format!("Fix final review round {round} MUST_FIX findings"),
+        max_attempts: Some(1),
+        timeout_seconds: None,
+        output: format!("output/{task_id}.md"),
+        prompt: format!(
+            "Fix only these final review MUST_FIX findings, preserve existing behavior, then summarize the changes.\n\n```json\n{findings_json}\n```"
+        ),
+        spec_file: Some(task_file.spec_file.clone()),
+        depends_on: Vec::new(),
+        review_criteria: vec![
+            "All listed MUST_FIX findings are resolved.".to_string(),
+            "No unrelated behavior or public contract is changed.".to_string(),
+        ],
+        analyze_timeout_seconds: None,
+        analyze_required: true,
+        require_review_approval: false,
+        max_review_attempts: 1,
+        review_timeout_seconds: None,
+        verification_commands: Vec::new(),
+        extra: Map::new(),
+    });
+    store.write_task_file(run_id, &next)?;
+    store.update_run_state(run_id, |state| {
+        ensure_state_matches_tasks(&next, state)?;
+        let task_state = find_task_state_mut(state, &task_id)?;
+        task_state.status = TaskStatus::Pending;
+        task_state.phase = None;
+        task_state.attempts = 0;
+        task_state.review_attempts = 0;
+        task_state.last_error = None;
+        task_state.last_log = None;
+        task_state.last_verdict = None;
+        task_state.last_review_comments = None;
+        task_state.updated_at = Some(current_timestamp()?);
+        Ok(())
+    })?;
+    append_event_log(
+        &store.run_dir(run_id)?,
+        &format!("generated final-fix task {task_id} for round {round}"),
+    )?;
+    Ok(task_id)
+}
+
+fn record_final_fix_task(
+    store: &RunStore,
+    run_id: &str,
+    round: u64,
+    task_id: &str,
+) -> std::result::Result<(), AppError> {
+    store.update_run_state(run_id, |state| {
+        if let Some(round_state) = state
+            .final_review
+            .rounds
+            .iter_mut()
+            .rev()
+            .find(|candidate| candidate.round == round)
+        {
+            round_state.final_fix_task_id = Some(task_id.to_string());
+        }
+        Ok(())
+    })
+}
+
+fn run_final_fix_task(
+    context: &ConfigContext,
+    store: &RunStore,
+    run_id: &str,
+    task_id: &str,
+    codex_bin: Option<PathBuf>,
+) -> std::result::Result<(), AppError> {
+    for _ in 0..20 {
+        let outcome = execute_task_until_boundary(
+            context,
+            store,
+            run_id,
+            task_id,
+            codex_bin.clone(),
+            false,
+            true,
+        )?;
+        let state = store.read_run_state(run_id)?;
+        let task_state = find_task_state(&state, task_id)?;
+        match task_state.status {
+            TaskStatus::Done => return Ok(()),
+            TaskStatus::Blocked | TaskStatus::ReviewFailed => {
+                return Err(AppError::Runtime(format!(
+                    "final-fix task {task_id} stopped at status {}: {}",
+                    task_state.status.as_str(),
+                    task_state.last_error.clone().unwrap_or_default()
+                )));
+            }
+            _ => {}
+        }
+        if matches!(
+            outcome,
+            TaskExecutionOutcome::FailedRetryable
+                | TaskExecutionOutcome::Blocked
+                | TaskExecutionOutcome::ReviewChangesRequested
+                | TaskExecutionOutcome::Deferred
+        ) {
+            return Err(AppError::Runtime(format!(
+                "final-fix task {task_id} did not complete; outcome={outcome:?}"
+            )));
+        }
+    }
+    Err(AppError::Runtime(format!(
+        "final-fix task {task_id} exceeded scheduler step limit"
+    )))
 }
 
 pub fn inspect_run(
@@ -4415,10 +6725,12 @@ pub fn inspect_run_in_repo(
     let archived_runs = discover_archived_runs(&store)?;
     let selected = match options.run_id.as_deref() {
         Some(_) => Some(resolve_existing_run_location(
+            &context.repo_root,
             &store,
             options.run_id.as_deref(),
         )?),
         None if active_runs.len() == 1 => Some(resolve_existing_run_location(
+            &context.repo_root,
             &store,
             Some(&active_runs[0]),
         )?),
@@ -4464,6 +6776,10 @@ pub fn format_inspect_text(view: &RunInspectView) -> String {
             out.push_str(&format!("Archive: {archive_name}\n"));
         }
         out.push_str(&format!("Run dir: {}\n", selected.run_dir.display()));
+        out.push_str(&format!(
+            "Visible run dir: {}\n",
+            selected.visible_run_dir.display()
+        ));
         out.push_str(&format!("Tasks: {}\n", selected.tasks_path.display()));
         out.push_str(&format!("State: {}\n", selected.state_path.display()));
         out.push_str(&format!("Metadata: {}\n", selected.metadata_path.display()));
@@ -4490,7 +6806,8 @@ pub fn read_run_logs_in_repo(
     let context = load_config(repo_root, home, true)?;
     let store = RunStore::for_repo(&context.repo_root, &context.home_dir)
         .map_err(|err| AppError::Runtime(format!("failed to resolve run store: {err}")))?;
-    let location = resolve_existing_run_location(&store, options.run_id.as_deref())?;
+    let location =
+        resolve_existing_run_location(&context.repo_root, &store, options.run_id.as_deref())?;
     let logs_dir = location.logs_dir.clone();
     let mut files = discover_log_files(
         &logs_dir,
@@ -4775,6 +7092,7 @@ fn select_run_id(
 }
 
 fn resolve_existing_run_location(
+    repo_root: &Path,
     store: &RunStore,
     requested: Option<&str>,
 ) -> std::result::Result<RunLocationView, AppError> {
@@ -4783,7 +7101,13 @@ fn resolve_existing_run_location(
             RunId::parse(run_id)?;
             let active = store.run_dir(run_id)?;
             if active.exists() {
-                return Ok(run_location_view(run_id.to_string(), active, false, None));
+                return Ok(run_location_view(
+                    repo_root,
+                    run_id.to_string(),
+                    active,
+                    false,
+                    None,
+                ));
             }
             let archives = discover_archived_runs(store)?
                 .into_iter()
@@ -4791,6 +7115,7 @@ fn resolve_existing_run_location(
                 .collect::<Vec<_>>();
             if let Some(archive) = archives.last() {
                 return Ok(run_location_view(
+                    repo_root,
                     archive.run_id.clone(),
                     archive.run_dir.clone(),
                     true,
@@ -4807,6 +7132,7 @@ fn resolve_existing_run_location(
             if active_runs.len() == 1 {
                 let run_id = active_runs[0].clone();
                 return Ok(run_location_view(
+                    repo_root,
                     run_id.clone(),
                     store.run_dir(&run_id)?,
                     false,
@@ -4825,6 +7151,7 @@ fn resolve_existing_run_location(
             if archives.len() == 1 {
                 let archive = &archives[0];
                 return Ok(run_location_view(
+                    repo_root,
                     archive.run_id.clone(),
                     archive.run_dir.clone(),
                     true,
@@ -4852,12 +7179,14 @@ fn resolve_existing_run_location(
 }
 
 fn run_location_view(
+    repo_root: &Path,
     run_id: String,
     run_dir: PathBuf,
     archived: bool,
     archive_name: Option<String>,
 ) -> RunLocationView {
     RunLocationView {
+        visible_run_dir: project_task_run_dir(repo_root, &run_id),
         run_id,
         tasks_path: run_dir.join("tasks.json"),
         state_path: run_dir.join("state.json"),
@@ -6866,32 +9195,6 @@ fn render_review_task_prompt(
         .map_err(|err| AppError::Config(err.to_string()))
 }
 
-fn render_review_feature_prompt(
-    context: &ConfigContext,
-    store: &RunStore,
-    run_id: &str,
-    task_file: &TaskFile,
-    output_path: &Path,
-) -> std::result::Result<String, AppError> {
-    let spec = SpecDocument::read(&context.repo_root.join(&task_file.spec_file))?;
-    let state = store.read_run_state(run_id)?;
-    let input = ReviewFeaturePromptInput {
-        common: common_prompt_variables(context, store, run_id)?,
-        run_id: task_file.run_id.clone(),
-        branch: task_file.branch.clone(),
-        spec_file: task_file.spec_file.clone(),
-        feature_spec: spec.body,
-        git_diff: feature_branch_diff(&context.repo_root, &context.merged.project.default_branch)?,
-        tasks_summaries: task_summaries(task_file, &state),
-        output_feature_review_path: output_path.display().to_string(),
-    };
-    let template = load_prompt_template(context, PromptTemplateKind::ReviewFeature)
-        .map_err(|err| AppError::Config(err.to_string()))?;
-    template
-        .render(&input)
-        .map_err(|err| AppError::Config(err.to_string()))
-}
-
 fn common_prompt_variables(
     context: &ConfigContext,
     store: &RunStore,
@@ -7315,12 +9618,6 @@ fn review_output_path(run_dir: &Path, task_id: &str) -> PathBuf {
     run_dir.join("output").join(format!("{task_id}.review.md"))
 }
 
-fn feature_review_output_path(run_dir: &Path, attempt: u64) -> PathBuf {
-    run_dir
-        .join("output")
-        .join(format!("feature-review.{attempt}.md"))
-}
-
 fn read_optional_file(path: &str) -> Option<String> {
     fs::read_to_string(path).ok()
 }
@@ -7600,30 +9897,6 @@ fn git_diff_command<const N: usize>(
         return Err(AppError::Runtime(format_git_error("git diff", &output)));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-fn task_summaries(task_file: &TaskFile, state: &RunState) -> String {
-    let state_by_id = normalized_state_map(task_file, state).unwrap_or_default();
-    let mut lines = Vec::new();
-    for task in &task_file.tasks {
-        let state = state_by_id.get(task.id.as_str());
-        let status = state
-            .map(|task_state| task_state.status.as_str())
-            .unwrap_or("pending");
-        let phase = state
-            .and_then(|task_state| task_state.phase)
-            .map(TaskPhase::as_str)
-            .unwrap_or("-");
-        let verdict = state
-            .and_then(|task_state| task_state.last_verdict)
-            .map(ReviewVerdict::as_str)
-            .unwrap_or("-");
-        lines.push(format!(
-            "- {}: {} (status: {status}, phase: {phase}, verdict: {verdict})",
-            task.id, task.title
-        ));
-    }
-    lines.join("\n")
 }
 
 fn current_timestamp() -> std::result::Result<String, AppError> {
@@ -7930,8 +10203,10 @@ fn merge_status_view(
         branch: task_file.branch,
         spec_file: task_file.spec_file,
         run_dir,
+        requirement_review_status: run_state.requirement_review.status.as_str().to_string(),
         feature_review_status: run_state.feature_review_status.as_str().to_string(),
         feature_review_attempts: run_state.feature_review_attempts,
+        final_review_status: run_state.final_review.status.as_str().to_string(),
         counts,
         tasks,
     })
@@ -7966,9 +10241,14 @@ pub fn format_status_text(view: &StatusView) -> String {
     out.push_str(&format!("Spec: {}\n", view.spec_file));
     out.push_str(&format!("Run store: {}\n", view.run_dir.display()));
     out.push_str(&format!(
+        "Requirement review: {}\n",
+        view.requirement_review_status
+    ));
+    out.push_str(&format!(
         "Feature review: {} (attempts: {})\n",
         view.feature_review_status, view.feature_review_attempts
     ));
+    out.push_str(&format!("Final review: {}\n", view.final_review_status));
     out.push_str("Counts:");
     for status in TASK_STATUS_ORDER {
         let key = status.as_str();
@@ -8167,7 +10447,7 @@ profile = "team"
     }
 
     #[test]
-    fn builtin_prompt_templates_render_all_five_typed_inputs() {
+    fn builtin_prompt_templates_render_all_typed_inputs() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
         let home = temp.path().join("home");
@@ -8181,6 +10461,20 @@ profile = "team"
             .unwrap();
         assert!(decompose.contains("run-1"));
         assert!(decompose.contains("Feature body"));
+
+        let requirement = load_prompt_template(&context, PromptTemplateKind::RequirementReview)
+            .unwrap()
+            .render(&sample_requirement_review_input())
+            .unwrap();
+        assert!(requirement.contains("Requirement review output path"));
+        assert!(requirement.contains("NEEDS_CLARIFICATION"));
+
+        let resolve = load_prompt_template(&context, PromptTemplateKind::ResolveRequirement)
+            .unwrap()
+            .render(&sample_resolve_requirement_input())
+            .unwrap();
+        assert!(resolve.contains("Resolved spec output path"));
+        assert!(resolve.contains("User answers"));
 
         let analyze = load_prompt_template(&context, PromptTemplateKind::AnalyzeTask)
             .unwrap()
@@ -8209,6 +10503,20 @@ profile = "team"
             .unwrap();
         assert!(feature.contains("Task summaries"));
         assert!(feature.contains("must not append tasks"));
+
+        let shard = load_prompt_template(&context, PromptTemplateKind::FinalReviewShard)
+            .unwrap()
+            .render(&sample_final_review_shard_input())
+            .unwrap();
+        assert!(shard.contains("Review type: security"));
+        assert!(shard.contains("Findings output path"));
+
+        let aggregate = load_prompt_template(&context, PromptTemplateKind::FinalReviewAggregate)
+            .unwrap()
+            .render(&sample_final_review_aggregate_input())
+            .unwrap();
+        assert!(aggregate.contains("Aggregate review output path"));
+        assert!(aggregate.contains("Shard findings"));
     }
 
     #[cfg(unix)]
@@ -8521,6 +10829,8 @@ printf '   \n' > "{}"
 
         let state = RunState {
             schema_version: 1,
+            requirement_review: RequirementReviewState::default(),
+            final_review: FinalReviewState::default(),
             feature_review_status: FeatureReviewStatus::Pending,
             feature_review_attempts: 0,
             tasks: vec![TaskState {
@@ -8669,6 +10979,8 @@ printf '   \n' > "{}"
         let store = RunStore::for_repo(&repo, &home).unwrap();
         let state = RunState {
             schema_version: 1,
+            requirement_review: RequirementReviewState::default(),
+            final_review: FinalReviewState::default(),
             feature_review_status: FeatureReviewStatus::Pending,
             feature_review_attempts: 0,
             tasks: vec![TaskState {
@@ -8831,7 +11143,7 @@ printf '   \n' > "{}"
 
         let codex = fake_codex_script(
             temp.path(),
-            &write_last_message_script(&sample_decompose_json(
+            &requirement_clear_then_last_message_script(&sample_decompose_json(
                 "feature",
                 "feat/feature",
                 "docs/roadmap/feature.md",
@@ -8907,7 +11219,7 @@ add_include = ["src/**"]
 
         let decompose_codex = fake_codex_script(
             temp.path(),
-            &write_last_message_script(&sample_decompose_json(
+            &requirement_clear_then_last_message_script(&sample_decompose_json(
                 "feature",
                 "feat/feature",
                 "docs/roadmap/feature.md",
@@ -8978,7 +11290,11 @@ add_include = ["src/**"]
 
         let codex = fake_codex_script(
             temp.path(),
-            &write_last_message_script(&sample_decompose_json("spec", "feat/spec", "docs/spec.md")),
+            &requirement_clear_then_last_message_script(&sample_decompose_json(
+                "spec",
+                "feat/spec",
+                "docs/spec.md",
+            )),
         );
         let first = start_run_in_repo(
             &repo,
@@ -9029,7 +11345,7 @@ add_include = ["src/**"]
         let json = sample_decompose_json("feature", "feat/feature", "feature.md");
         let codex = fake_codex_script(
             temp.path(),
-            &write_last_message_script(&format!("```json\n{json}\n```\n")),
+            &requirement_clear_then_last_message_script(&format!("```json\n{json}\n```\n")),
         );
         let result = start_run_in_repo(
             &repo,
@@ -9069,7 +11385,10 @@ add_include = ["src/**"]
         git(&repo, ["add", "."]);
         git(&repo, ["commit", "-m", "spec"]);
 
-        let codex = fake_codex_script(temp.path(), &write_last_message_script("not json\n"));
+        let codex = fake_codex_script(
+            temp.path(),
+            &requirement_clear_then_last_message_script("not json\n"),
+        );
         let err = start_run_in_repo(
             &repo,
             &home,
@@ -9113,7 +11432,7 @@ add_include = ["src/**"]
         git(&repo, ["add", "."]);
         git(&repo, ["commit", "-m", "spec"]);
 
-        let codex = fake_codex_script(temp.path(), "printf 'codex failed\\n' >&2\nexit 7");
+        let codex = fake_codex_script(temp.path(), &requirement_clear_then_fail_script());
         let err = start_run_in_repo(
             &repo,
             &home,
@@ -9136,6 +11455,143 @@ add_include = ["src/**"]
             fs::read_to_string(run_dir.join("logs/decompose.stderr.log"))
                 .unwrap()
                 .contains("codex failed")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn requirement_review_needs_clarification_writes_visible_files_and_no_tasks() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let home = temp.path().join("home");
+        init_test_repo(&repo);
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            repo.join("feature.md"),
+            "# Feature\n\nDo something vague.\n",
+        )
+        .unwrap();
+        git(&repo, ["add", "."]);
+        git(&repo, ["commit", "-m", "spec"]);
+
+        let codex = fake_codex_script(
+            temp.path(),
+            &requirement_needs_clarification_script("- What exactly should change?"),
+        );
+        let result = start_run_in_repo(
+            &repo,
+            &home,
+            &repo,
+            StartOptions {
+                spec_path: PathBuf::from("feature.md"),
+                run_id: None,
+                branch: None,
+                resume: false,
+                codex_bin: Some(codex),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.requirement_status, "needs_clarification");
+        assert!(!result.tasks_path.exists());
+        let questions = result.questions_path.unwrap();
+        let answers = result.answers_path.unwrap();
+        assert!(questions.starts_with(repo.join(".codex/task-runs/feature")));
+        assert!(answers.starts_with(repo.join(".codex/task-runs/feature")));
+        assert!(
+            fs::read_to_string(&questions)
+                .unwrap()
+                .contains("What exactly")
+        );
+        assert!(fs::read_to_string(&answers).unwrap().contains("TODO"));
+
+        let store = RunStore::for_repo(&repo, &home).unwrap();
+        let state = store.read_run_state("feature").unwrap();
+        assert_eq!(
+            state.requirement_review.status,
+            RequirementReviewStatus::NeedsClarification
+        );
+        let metadata = store.read_metadata("feature").unwrap();
+        assert_eq!(
+            metadata.requirement_review.status,
+            RequirementReviewStatus::NeedsClarification
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_after_answers_writes_resolved_spec_and_decomposes() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let home = temp.path().join("home");
+        init_test_repo(&repo);
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            repo.join("feature.md"),
+            "# Feature\n\nDo something vague.\n",
+        )
+        .unwrap();
+        git(&repo, ["add", "."]);
+        git(&repo, ["commit", "-m", "spec"]);
+
+        let start_codex = fake_codex_script(
+            temp.path(),
+            &requirement_needs_clarification_script("- What exactly should change?"),
+        );
+        let start = start_run_in_repo(
+            &repo,
+            &home,
+            &repo,
+            StartOptions {
+                spec_path: PathBuf::from("feature.md"),
+                run_id: None,
+                branch: None,
+                resume: false,
+                codex_bin: Some(start_codex),
+            },
+        )
+        .unwrap();
+        let answers_path = start.answers_path.unwrap();
+        fs::write(
+            &answers_path,
+            "# Answers for feature\n\n## Answers\n\nBuild the explicit scheduler path.\n",
+        )
+        .unwrap();
+
+        let resolved_spec_file = ".codex/task-runs/feature/resolved-spec.md";
+        let resume_codex = fake_codex_script(
+            temp.path(),
+            &resolve_then_decompose_script(
+                "# Resolved Spec\n\nBuild the explicit scheduler path.\n",
+                &sample_decompose_json("feature", "feat/feature", resolved_spec_file),
+            ),
+        );
+        let resumed = resume_run_in_repo(
+            &repo,
+            &home,
+            ResumeOptions {
+                run_id: "feature".to_string(),
+                codex_bin: Some(resume_codex),
+            },
+        )
+        .unwrap();
+
+        assert!(resumed.tasks_path.exists());
+        assert_eq!(resumed.requirement_status, "resolved");
+        assert_eq!(resumed.spec_file, resolved_spec_file);
+        assert!(resumed.resolved_spec_path.unwrap().exists());
+        let store = RunStore::for_repo(&repo, &home).unwrap();
+        let task_file = store.read_task_file("feature").unwrap();
+        assert_eq!(task_file.spec_file, resolved_spec_file);
+        let state = store.read_run_state("feature").unwrap();
+        assert_eq!(
+            state.requirement_review.status,
+            RequirementReviewStatus::Resolved
+        );
+        let metadata = store.read_metadata("feature").unwrap();
+        assert_eq!(
+            metadata.resolved_spec_file.as_deref(),
+            Some(resolved_spec_file)
         );
     }
 
@@ -9358,11 +11814,9 @@ printf 'implemented after optional analysis failure\n' > "$last"
         init_test_repo(&repo);
         write_spec_and_commit(&repo, "spec.md");
 
-        let task_file = sample_run_task_file(
-            "run",
-            "spec.md",
-            vec![sample_task("p1", 1), sample_task("p2", 2)],
-        );
+        let mut p1 = sample_task("p1", 1);
+        p1.timeout_seconds = Some(20);
+        let task_file = sample_run_task_file("run", "spec.md", vec![p1, sample_task("p2", 2)]);
         let store = RunStore::for_repo(&repo, &home).unwrap();
         store.write_task_file("run", &task_file).unwrap();
         let mut state = initial_run_state(&task_file);
@@ -9419,7 +11873,7 @@ exit 99
         });
 
         let started = slow_codex_dir.join("started");
-        for _ in 0..50 {
+        for _ in 0..150 {
             if started.exists() {
                 break;
             }
@@ -10624,11 +13078,19 @@ add_include = [".codex/**", "src/**"]
 
     #[cfg(unix)]
     #[test]
-    fn final_review_changes_requested_updates_state_without_appending_tasks() {
+    fn final_review_must_fix_blocks_at_max_rounds_without_appending_tasks() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
         let home = temp.path().join("home");
         init_test_repo(&repo);
+        fs::write(
+            repo.join(".codex/task-runner.toml"),
+            r#"
+[runner]
+max_final_review_rounds = 1
+"#,
+        )
+        .unwrap();
         write_spec_and_commit(&repo, "spec.md");
 
         let task_file = sample_run_task_file("run", "spec.md", vec![sample_task("p1", 1)]);
@@ -10641,7 +13103,7 @@ add_include = [".codex/**", "src/**"]
 
         let codex = fake_codex_script(
             temp.path(),
-            &feature_review_report_script("CHANGES_REQUESTED", "- [MUST] Finish integration."),
+            &final_review_must_fix_script("Finish integration."),
         );
         let result = finalize_run_in_repo(
             &repo,
@@ -10656,21 +13118,32 @@ add_include = [".codex/**", "src/**"]
 
         assert_eq!(result.exit_code, 1);
         let state = store.read_run_state("run").unwrap();
-        assert_eq!(
-            state.feature_review_status,
-            FeatureReviewStatus::ChangesRequested
-        );
+        assert_eq!(state.feature_review_status, FeatureReviewStatus::Blocked);
         assert_eq!(state.feature_review_attempts, 1);
+        assert_eq!(state.final_review.remaining_must_fix.len(), 9);
+        let round = &state.final_review.rounds[0];
+        assert_eq!(round.shards.len(), FINAL_REVIEW_TYPES.len());
+        assert!(Path::new(round.change_map_path.as_deref().unwrap()).exists());
+        assert!(Path::new(round.review_plan_path.as_deref().unwrap()).exists());
+        assert!(Path::new(round.findings_path.as_deref().unwrap()).exists());
         assert_eq!(store.read_task_file("run").unwrap().tasks.len(), 1);
     }
 
     #[cfg(unix)]
     #[test]
-    fn final_review_invalid_verdict_is_failed_not_approved() {
+    fn final_review_invalid_verdict_is_blocked_not_approved() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
         let home = temp.path().join("home");
         init_test_repo(&repo);
+        fs::write(
+            repo.join(".codex/task-runner.toml"),
+            r#"
+[runner]
+max_final_review_rounds = 1
+"#,
+        )
+        .unwrap();
         write_spec_and_commit(&repo, "spec.md");
 
         let task_file = sample_run_task_file("run", "spec.md", vec![sample_task("p1", 1)]);
@@ -10681,10 +13154,7 @@ add_include = [".codex/**", "src/**"]
         state.tasks[0].phase = Some(TaskPhase::Commit);
         store.write_run_state("run", &state).unwrap();
 
-        let codex = fake_codex_script(
-            temp.path(),
-            &feature_review_report_script("PASS", "Invalid verdict."),
-        );
+        let codex = fake_codex_script(temp.path(), &final_review_invalid_shard_script());
         let result = finalize_run_in_repo(
             &repo,
             &home,
@@ -10698,7 +13168,7 @@ add_include = [".codex/**", "src/**"]
 
         assert_eq!(result.exit_code, 1);
         let state = store.read_run_state("run").unwrap();
-        assert_eq!(state.feature_review_status, FeatureReviewStatus::Failed);
+        assert_eq!(state.feature_review_status, FeatureReviewStatus::Blocked);
         assert_eq!(state.feature_review_attempts, 1);
         assert!(
             state
@@ -10706,7 +13176,7 @@ add_include = [".codex/**", "src/**"]
                 .get("featureReviewLastError")
                 .and_then(Value::as_str)
                 .unwrap()
-                .contains("invalid")
+                .contains("remaining MUST_FIX")
         );
     }
 
@@ -10729,10 +13199,7 @@ add_include = [".codex/**", "src/**"]
         let run_dir = store.run_dir("run").unwrap();
         assert!(run_dir.exists());
 
-        let codex = fake_codex_script(
-            temp.path(),
-            &feature_review_report_script("APPROVED", "Feature is complete."),
-        );
+        let codex = fake_codex_script(temp.path(), &final_review_all_approved_script());
         let result = finalize_run_in_repo(
             &repo,
             &home,
@@ -10757,6 +13224,11 @@ add_include = [".codex/**", "src/**"]
         assert_eq!(
             archived_state.feature_review_status,
             FeatureReviewStatus::Approved
+        );
+        assert_eq!(archived_state.final_review.rounds.len(), 1);
+        assert_eq!(
+            archived_state.final_review.rounds[0].shards.len(),
+            FINAL_REVIEW_TYPES.len()
         );
 
         let spec_text = fs::read_to_string(repo.join("spec.md")).unwrap();
@@ -10973,7 +13445,47 @@ printf 'review complete\n' > "$last"
         )
     }
 
-    fn feature_review_report_script(verdict: &str, body: &str) -> String {
+    fn final_review_all_approved_script() -> String {
+        final_review_script(
+            r#"{"verdict":"APPROVED","findings":[]}"#,
+            "APPROVED",
+            "Feature is complete.",
+        )
+    }
+
+    fn final_review_must_fix_script(detail: &str) -> String {
+        final_review_script(
+            &format!(
+                r#"{{
+  "verdict": "CHANGES_REQUESTED",
+  "findings": [
+    {{
+      "id": "must-fix",
+      "severity": "MUST_FIX",
+      "title": "Blocking issue",
+      "detail": "{detail}"
+    }}
+  ]
+}}"#
+            ),
+            "CHANGES_REQUESTED",
+            "Blocking issues remain.",
+        )
+    }
+
+    fn final_review_invalid_shard_script() -> String {
+        final_review_script(
+            r#"{"verdict":"PASS","findings":[]}"#,
+            "APPROVED",
+            "Invalid shard.",
+        )
+    }
+
+    fn final_review_script(
+        shard_json: &str,
+        aggregate_verdict: &str,
+        aggregate_body: &str,
+    ) -> String {
         format!(
             r#"
 last=""
@@ -10984,17 +13496,31 @@ while [ "$#" -gt 0 ]; do
   fi
   shift || break
 done
-out=$(sed -n 's/^Feature review output path: //p' "$script_dir/stdin.log" | head -n 1)
-mkdir -p "$(dirname "$out")"
-cat > "$out" <<'CODEX_REVIEW'
+if grep -q '^Findings output path:' "$script_dir/stdin.log"; then
+  out=$(sed -n 's/^Findings output path: //p' "$script_dir/stdin.log" | head -n 1)
+  mkdir -p "$(dirname "$out")"
+  cat > "$out" <<'CODEX_SHARD'
+{shard_json}
+CODEX_SHARD
+  printf 'final review shard complete\n' > "$last"
+  exit 0
+fi
+if grep -q '^Aggregate review output path:' "$script_dir/stdin.log"; then
+  out=$(sed -n 's/^Aggregate review output path: //p' "$script_dir/stdin.log" | head -n 1)
+  mkdir -p "$(dirname "$out")"
+  cat > "$out" <<'CODEX_REVIEW'
 ---
-verdict: {verdict}
+verdict: {aggregate_verdict}
 reviewed_at: 2026-06-16T00:00:00Z
 ---
 
-{body}
+{aggregate_body}
 CODEX_REVIEW
-printf 'feature review complete\n' > "$last"
+  printf 'final review aggregate complete\n' > "$last"
+  exit 0
+fi
+printf 'unexpected prompt\n' >&2
+exit 9
 "#
         )
     }
@@ -11006,17 +13532,17 @@ printf 'feature review complete\n' > "$last"
             group: "scheduler".to_string(),
             title: format!("Task {id}"),
             max_attempts: Some(3),
-            timeout_seconds: Some(5),
+            timeout_seconds: Some(20),
             output: format!("output/{id}.md"),
             prompt: format!("Implement {id}."),
             spec_file: None,
             depends_on: Vec::new(),
             review_criteria: Vec::new(),
-            analyze_timeout_seconds: Some(5),
+            analyze_timeout_seconds: Some(20),
             analyze_required: true,
             require_review_approval: false,
             max_review_attempts: 2,
-            review_timeout_seconds: Some(5),
+            review_timeout_seconds: Some(20),
             verification_commands: Vec::new(),
             extra: Map::new(),
         }
@@ -11102,6 +13628,26 @@ printf 'implementation summary\n' > "$last"
         }
     }
 
+    fn sample_requirement_review_input() -> RequirementReviewPromptInput {
+        RequirementReviewPromptInput {
+            common: sample_common_variables(),
+            spec_file: "docs/roadmap/feature.md".to_string(),
+            feature_spec: "Feature body".to_string(),
+            output_review_path: "output/requirement-review.md".to_string(),
+        }
+    }
+
+    fn sample_resolve_requirement_input() -> ResolveRequirementPromptInput {
+        ResolveRequirementPromptInput {
+            common: sample_common_variables(),
+            spec_file: "docs/roadmap/feature.md".to_string(),
+            feature_spec: "Feature body".to_string(),
+            questions: "Question?".to_string(),
+            answers: "User answers".to_string(),
+            output_resolved_spec_path: ".codex/task-runs/run-1/resolved-spec.md".to_string(),
+        }
+    }
+
     fn sample_analyze_input() -> AnalyzeTaskPromptInput {
         AnalyzeTaskPromptInput {
             common: sample_common_variables(),
@@ -11162,6 +13708,39 @@ printf 'implementation summary\n' > "$last"
         }
     }
 
+    fn sample_final_review_shard_input() -> FinalReviewShardPromptInput {
+        FinalReviewShardPromptInput {
+            common: sample_common_variables(),
+            run_id: "run-1".to_string(),
+            branch: "feat/run-1".to_string(),
+            spec_file: "docs/roadmap/feature.md".to_string(),
+            resolved_spec: "Resolved spec".to_string(),
+            review_type: "security".to_string(),
+            change_map: "{}".to_string(),
+            relevant_diff: "diff --git a/src/lib.rs b/src/lib.rs".to_string(),
+            relevant_logs: "logs".to_string(),
+            relevant_files: "files".to_string(),
+            output_findings_path: "output/final-review/round-1/security.findings.json".to_string(),
+        }
+    }
+
+    fn sample_final_review_aggregate_input() -> FinalReviewAggregatePromptInput {
+        FinalReviewAggregatePromptInput {
+            common: sample_common_variables(),
+            run_id: "run-1".to_string(),
+            branch: "feat/run-1".to_string(),
+            spec_file: "docs/roadmap/feature.md".to_string(),
+            resolved_spec: "Resolved spec".to_string(),
+            change_map: "{}".to_string(),
+            shard_findings: "Shard findings".to_string(),
+            public_api_summary: "API summary".to_string(),
+            db_summary: "DB summary".to_string(),
+            docs_summary: "Docs summary".to_string(),
+            verification_summary: "Verification summary".to_string(),
+            output_review_path: "output/final-review/round-1/aggregate-review.md".to_string(),
+        }
+    }
+
     #[cfg(unix)]
     fn sample_codex_request(root: &Path) -> CodexRunRequest {
         CodexRunRequest {
@@ -11176,7 +13755,7 @@ printf 'implementation summary\n' > "$last"
             model: None,
             reasoning_effort: None,
             search: None,
-            timeout_seconds: 5,
+            timeout_seconds: 20,
         }
     }
 
@@ -11235,7 +13814,7 @@ cat > "$script_dir/stdin.log"
     }
 
     #[cfg(unix)]
-    fn write_last_message_script(message: &str) -> String {
+    fn requirement_clear_then_last_message_script(message: &str) -> String {
         format!(
             r#"last=""
 while [ "$#" -gt 0 ]; do
@@ -11245,9 +13824,106 @@ while [ "$#" -gt 0 ]; do
   fi
   shift || break
 done
+if grep -q '^Requirement review output path:' "$script_dir/stdin.log"; then
+  out=$(sed -n 's/^Requirement review output path: //p' "$script_dir/stdin.log" | head -n 1)
+  mkdir -p "$(dirname "$out")"
+  cat > "$out" <<'CODEX_REQUIREMENT'
+---
+verdict: CLEAR
+reviewed_at: 2026-06-16T00:00:00Z
+---
+
+Clear.
+CODEX_REQUIREMENT
+  printf 'requirement clear\n' > "$last"
+  exit 0
+fi
 cat > "$last" <<'CODEX_LAST_MESSAGE'
 {message}
 CODEX_LAST_MESSAGE
+"#
+        )
+    }
+
+    #[cfg(unix)]
+    fn requirement_clear_then_fail_script() -> String {
+        r#"last=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    last="$1"
+  fi
+  shift || break
+done
+if grep -q '^Requirement review output path:' "$script_dir/stdin.log"; then
+  out=$(sed -n 's/^Requirement review output path: //p' "$script_dir/stdin.log" | head -n 1)
+  mkdir -p "$(dirname "$out")"
+  cat > "$out" <<'CODEX_REQUIREMENT'
+---
+verdict: CLEAR
+reviewed_at: 2026-06-16T00:00:00Z
+---
+
+Clear.
+CODEX_REQUIREMENT
+  printf 'requirement clear\n' > "$last"
+  exit 0
+fi
+printf 'codex failed\n' >&2
+exit 7
+"#
+        .to_string()
+    }
+
+    #[cfg(unix)]
+    fn requirement_needs_clarification_script(questions: &str) -> String {
+        format!(
+            r#"last=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    last="$1"
+  fi
+  shift || break
+done
+out=$(sed -n 's/^Requirement review output path: //p' "$script_dir/stdin.log" | head -n 1)
+mkdir -p "$(dirname "$out")"
+cat > "$out" <<'CODEX_REQUIREMENT'
+---
+verdict: NEEDS_CLARIFICATION
+reviewed_at: 2026-06-16T00:00:00Z
+---
+
+{questions}
+CODEX_REQUIREMENT
+printf 'requirement needs clarification\n' > "$last"
+"#
+        )
+    }
+
+    #[cfg(unix)]
+    fn resolve_then_decompose_script(resolved_spec: &str, decompose_json: &str) -> String {
+        format!(
+            r#"last=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    last="$1"
+  fi
+  shift || break
+done
+if grep -q '^Resolved spec output path:' "$script_dir/stdin.log"; then
+  out=$(sed -n 's/^Resolved spec output path: //p' "$script_dir/stdin.log" | head -n 1)
+  mkdir -p "$(dirname "$out")"
+  cat > "$out" <<'CODEX_RESOLVED'
+{resolved_spec}
+CODEX_RESOLVED
+  printf 'resolved spec\n' > "$last"
+  exit 0
+fi
+cat > "$last" <<'CODEX_DECOMPOSE'
+{decompose_json}
+CODEX_DECOMPOSE
 "#
         )
     }

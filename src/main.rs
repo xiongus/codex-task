@@ -1,11 +1,11 @@
 use clap::{Parser, Subcommand};
 use codex_task::{
-    AppError, FinalizeOptions, InspectOptions, LogsOptions, ResetTaskOptions, ReviewOptions,
-    RunTaskOptions, StartOptions, StatusResult, TaskPhase, VerifyOptions, WatchOptions,
-    finalize_run, find_repo_root, format_doctor_text, format_inspect_text, format_logs_text,
-    format_reset_text, format_status_text, home_dir, init_project, inspect_run, load_status,
-    read_run_logs, reset_task, review_task, run_doctor, run_one_task, start_run, verify_tasks,
-    watch_run,
+    AppError, FinalizeOptions, InspectOptions, LogsOptions, ResetTaskOptions, ResumeOptions,
+    ReviewOptions, RunTaskOptions, StartOptions, StatusResult, TaskPhase, VerifyOptions,
+    WatchOptions, finalize_run, find_repo_root, format_doctor_text, format_inspect_text,
+    format_logs_text, format_reset_text, format_status_text, home_dir, init_project, inspect_run,
+    load_status, read_run_logs, reset_task, resume_run, review_task, run_doctor, run_one_task,
+    start_run, verify_tasks, watch_run,
 };
 use std::path::PathBuf;
 
@@ -83,6 +83,12 @@ enum Commands {
         /// Require an existing run instead of decomposing a new one.
         #[arg(long)]
         resume: bool,
+    },
+    /// Resume a run paused by requirement review after answers.md is filled.
+    Resume {
+        /// Run id under the repository run store.
+        #[arg(long)]
+        run_id: String,
     },
     /// Run pending tasks serially through analyze and implement phases.
     Watch {
@@ -305,6 +311,47 @@ fn run(cli: Cli) -> Result<i32, AppError> {
             println!("Branch: {}", result.branch);
             println!("Spec: {}", result.spec_file);
             println!("Run store: {}", result.run_dir.display());
+            println!("Visible run dir: {}", result.visible_run_dir.display());
+            println!("Requirement review: {}", result.requirement_status);
+            if let Some(path) = result.questions_path {
+                println!("Questions: {}", path.display());
+            }
+            if let Some(path) = result.answers_path {
+                println!("Answers: {}", path.display());
+            }
+            if let Some(path) = result.resolved_spec_path {
+                println!("Resolved spec: {}", path.display());
+            }
+            println!("Tasks: {}", result.tasks_path.display());
+            println!("State: {}", result.state_path.display());
+            for warning in result.warnings {
+                println!("warning: {warning}");
+            }
+            if result.requirement_status == "needs_clarification"
+                || result.requirement_status == "failed"
+            {
+                Ok(1)
+            } else {
+                Ok(0)
+            }
+        }
+        Commands::Resume { run_id } => {
+            let result = resume_run(
+                &cwd,
+                ResumeOptions {
+                    run_id,
+                    codex_bin: None,
+                },
+            )?;
+            println!("Resumed run {}", result.run_id);
+            println!("Branch: {}", result.branch);
+            println!("Spec: {}", result.spec_file);
+            println!("Run store: {}", result.run_dir.display());
+            println!("Visible run dir: {}", result.visible_run_dir.display());
+            println!("Requirement review: {}", result.requirement_status);
+            if let Some(path) = result.resolved_spec_path {
+                println!("Resolved spec: {}", path.display());
+            }
             println!("Tasks: {}", result.tasks_path.display());
             println!("State: {}", result.state_path.display());
             for warning in result.warnings {
