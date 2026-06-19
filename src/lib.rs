@@ -1436,7 +1436,7 @@ pub fn resume_run_in_repo(
         .map_err(|err| AppError::Io(format!("failed to read {}: {err}", answers_path.display())))?;
     if !answers_file_is_filled(&answers) {
         return Err(AppError::Runtime(format!(
-            "{} has no answers under `## Answers`",
+            "{} has no answers between codex-task answers markers",
             answers_path.display()
         )));
     }
@@ -1557,7 +1557,7 @@ fn resume_problem_decision(
     })?;
     if !decision_file_is_filled(&decision) {
         return Err(AppError::Runtime(format!(
-            "{} has no decision under `## Decision`",
+            "{} has no decision between codex-task decision markers",
             decision_path.display()
         )));
     }
@@ -2395,7 +2395,7 @@ fn write_decision_file(
             .map_err(|err| AppError::Io(format!("failed to create {}: {err}", parent.display())))?;
     }
     let text = format!(
-        "# Decision for {run_id}\n\nChoose the approach under `## Decision`, then run `codex-task resume --run-id {run_id}`.\n\n## Options\n\n{}\n\n## Decision\n\nTODO\n",
+        "# Decision for {run_id}\n\nChoose the approach between the markers, then run `codex-task resume --run-id {run_id}`.\n\n## Options\n\n{}\n\n## Decision\n\n<!-- codex-task:decision:start -->\nTODO\n<!-- codex-task:decision:end -->\n",
         options.trim()
     );
     fs::write(path, text)
@@ -2426,7 +2426,7 @@ fn write_answers_file(
             .map_err(|err| AppError::Io(format!("failed to create {}: {err}", parent.display())))?;
     }
     let text = format!(
-        "# Answers for {run_id}\n\nFill in the answers under `## Answers`, then run `codex-task resume --run-id {run_id}`.\n\n## Questions\n\n{}\n\n## Answers\n\nTODO\n",
+        "# Answers for {run_id}\n\nFill in the answers between the markers, then run `codex-task resume --run-id {run_id}`.\n\n## Questions\n\n{}\n\n## Answers\n\n<!-- codex-task:answers:start -->\nTODO\n<!-- codex-task:answers:end -->\n",
         questions.trim()
     );
     fs::write(path, text)
@@ -2434,21 +2434,24 @@ fn write_answers_file(
 }
 
 fn answers_file_is_filled(raw: &str) -> bool {
-    let answer_text = raw
-        .split_once("## Answers")
-        .map(|(_, answers)| answers)
-        .unwrap_or(raw)
-        .trim();
-    !answer_text.is_empty() && answer_text != "TODO"
+    marker_section(raw, "answers").is_some_and(section_is_filled)
 }
 
 fn decision_file_is_filled(raw: &str) -> bool {
-    let decision_text = raw
-        .split_once("## Decision")
-        .map(|(_, decision)| decision)
-        .unwrap_or(raw)
-        .trim();
-    !decision_text.is_empty() && decision_text != "TODO"
+    marker_section(raw, "decision").is_some_and(section_is_filled)
+}
+
+fn marker_section<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
+    let start = format!("<!-- codex-task:{name}:start -->");
+    let end = format!("<!-- codex-task:{name}:end -->");
+    let (_, after_start) = raw.split_once(&start)?;
+    let (section, _) = after_start.split_once(&end)?;
+    Some(section)
+}
+
+fn section_is_filled(section: &str) -> bool {
+    let trimmed = section.trim();
+    !trimmed.is_empty() && trimmed != "TODO"
 }
 
 #[derive(Debug, Clone)]
@@ -6680,20 +6683,22 @@ fn build_change_map(
         for (status, path) in
             git_name_status(&context.repo_root, &["diff", "--name-status", &range, "--"])?
         {
-            files.insert(path, status);
+            insert_business_change_path(&mut files, path, status);
         }
     }
     for (status, path) in git_name_status(
         &context.repo_root,
         &["diff", "--cached", "--name-status", "--"],
     )? {
-        files.insert(path, status);
+        insert_business_change_path(&mut files, path, status);
     }
     for (status, path) in git_name_status(&context.repo_root, &["diff", "--name-status", "--"])? {
-        files.insert(path, status);
+        insert_business_change_path(&mut files, path, status);
     }
     for entry in git_status_entries(&context.repo_root)? {
-        files.entry(entry.path).or_insert_with(|| "WT".to_string());
+        if !is_tool_collaboration_path(&entry.path) {
+            files.entry(entry.path).or_insert_with(|| "WT".to_string());
+        }
     }
 
     let changed_files = files
@@ -6731,6 +6736,12 @@ fn build_change_map(
         docs_summary,
         verification_summary,
     })
+}
+
+fn insert_business_change_path(files: &mut BTreeMap<String, String>, path: String, status: String) {
+    if !is_tool_collaboration_path(&path) {
+        files.insert(path, status);
+    }
 }
 
 fn git_name_status(
@@ -6856,8 +6867,8 @@ fn final_review_verification_summary(
     let mut lines = Vec::new();
     for task in &task_file.tasks {
         if let Some(task_state) = state_by_id.get(task.id.as_str()) {
-            let logs = task_state
-                .extra
+            let merged_extra = merged_task_state_extra(task, task_state);
+            let logs = merged_extra
                 .get("verificationLogs")
                 .and_then(Value::as_array)
                 .map(|values| {
@@ -6868,18 +6879,15 @@ fn final_review_verification_summary(
                         .join(", ")
                 })
                 .unwrap_or_else(|| "(none)".to_string());
-            let skipped = task_state
-                .extra
+            let skipped = merged_extra
                 .get("verificationSkipped")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let degraded = task_state
-                .extra
+            let degraded = merged_extra
                 .get("verificationDegraded")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let degraded_reason = task_state
-                .extra
+            let degraded_reason = merged_extra
                 .get("verificationDegradedReason")
                 .and_then(Value::as_str)
                 .unwrap_or("-");
@@ -6900,6 +6908,12 @@ fn final_review_verification_summary(
     } else {
         lines.join("\n")
     })
+}
+
+fn merged_task_state_extra(task: &Task, task_state: &TaskState) -> Map<String, Value> {
+    let mut extra = task.extra.clone();
+    extra.extend(task_state.extra.clone());
+    extra
 }
 
 fn build_review_plan(change_map: &ChangeMap) -> String {
@@ -7347,6 +7361,21 @@ fn append_final_fix_task(
         task_state.last_log = None;
         task_state.last_verdict = None;
         task_state.last_review_comments = None;
+        if verification_degraded {
+            task_state
+                .extra
+                .insert("verificationDegraded".to_string(), Value::Bool(true));
+            task_state.extra.insert(
+                "verificationDegradedReason".to_string(),
+                Value::String(
+                    "no global, task-file, or task-level verification commands are configured"
+                        .to_string(),
+                ),
+            );
+        } else {
+            task_state.extra.remove("verificationDegraded");
+            task_state.extra.remove("verificationDegradedReason");
+        }
         task_state.updated_at = Some(current_timestamp()?);
         Ok(())
     })?;
@@ -12314,7 +12343,7 @@ add_include = ["src/**"]
         let decision_path = start.decision_path.unwrap();
         fs::write(
             &decision_path,
-            "# Decision for feature\n\n## Decision\n\nUse Option A and keep auth boundaries.\n",
+            "# Decision for feature\n\n## Decision\n\n<!-- codex-task:decision:start -->\nUse Option A and keep auth boundaries.\n<!-- codex-task:decision:end -->\n",
         )
         .unwrap();
 
@@ -12449,7 +12478,7 @@ add_include = ["src/**"]
         let answers_path = start.answers_path.unwrap();
         fs::write(
             &answers_path,
-            "# Answers for feature\n\n## Answers\n\nBuild the explicit scheduler path.\n",
+            "# Answers for feature\n\n## Answers\n\n<!-- codex-task:answers:start -->\nBuild the explicit scheduler path.\n<!-- codex-task:answers:end -->\n",
         )
         .unwrap();
 
@@ -13264,6 +13293,65 @@ reviewed_at: 2026-06-16T00:00:00Z
         );
     }
 
+    #[test]
+    fn user_input_files_require_codex_task_markers() {
+        let misleading_answers = r#"# Answers for run
+
+## Questions
+
+The generated question mentions a section:
+
+## Answers
+
+TODO
+"#;
+        assert!(!answers_file_is_filled(misleading_answers));
+        assert!(answers_file_is_filled(
+            r#"# Answers for run
+
+<!-- codex-task:answers:start -->
+Use the explicit scheduler path.
+<!-- codex-task:answers:end -->
+"#
+        ));
+        assert!(!answers_file_is_filled(
+            r#"# Answers for run
+
+<!-- codex-task:answers:start -->
+TODO
+<!-- codex-task:answers:end -->
+"#
+        ));
+
+        let misleading_decision = r#"# Decision for run
+
+## Options
+
+Option text contains:
+
+## Decision
+
+TODO
+"#;
+        assert!(!decision_file_is_filled(misleading_decision));
+        assert!(decision_file_is_filled(
+            r#"# Decision for run
+
+<!-- codex-task:decision:start -->
+Choose option A.
+<!-- codex-task:decision:end -->
+"#
+        ));
+        assert!(!decision_file_is_filled(
+            r#"# Decision for run
+
+<!-- codex-task:decision:start -->
+TODO
+<!-- codex-task:decision:end -->
+"#
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn task_review_approved_uses_read_only_sandbox_and_marks_reviewed() {
@@ -14027,6 +14115,46 @@ add_include = [".codex/**", "src/**"]
         assert!(diff.contains("feature.txt"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn final_review_change_map_ignores_visible_task_run_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let home = temp.path().join("home");
+        init_test_repo(&repo);
+        write_spec_and_commit(&repo, "spec.md");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
+        fs::create_dir_all(repo.join(".codex/task-runs/run/final-review/round-1")).unwrap();
+        fs::write(
+            repo.join(".codex/task-runs/run/final-review/round-1/findings.json"),
+            "[]\n",
+        )
+        .unwrap();
+
+        let task_file = sample_run_task_file("run", "spec.md", vec![sample_task("p1", 1)]);
+        let store = RunStore::for_repo(&repo, &home).unwrap();
+        store.write_task_file("run", &task_file).unwrap();
+        store
+            .write_run_state("run", &initial_run_state(&task_file))
+            .unwrap();
+        let context = load_config(&repo, &home, true).unwrap();
+
+        let change_map = build_change_map(&context, &store, "run", &task_file).unwrap();
+        let paths = change_map
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(paths.contains(&"src/lib.rs"));
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.starts_with(".codex/task-runs/"))
+        );
+    }
+
     #[test]
     fn run_store_hash_isolates_multiple_repositories_with_same_run_id() {
         let temp = tempfile::tempdir().unwrap();
@@ -14213,6 +14341,26 @@ max_final_review_rounds = 1
                 .unwrap()
                 .contains("no global")
         );
+        let state = store.read_run_state("run").unwrap();
+        let final_fix_state = find_task_state(&state, "final-fix-round-1").unwrap();
+        assert_eq!(
+            final_fix_state
+                .extra
+                .get("verificationDegraded")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            final_fix_state
+                .extra
+                .get("verificationDegradedReason")
+                .and_then(Value::as_str)
+                .unwrap()
+                .contains("no global")
+        );
+        let summary = final_review_verification_summary(&store, "run", &updated).unwrap();
+        assert!(summary.contains("final-fix-round-1"));
+        assert!(summary.contains("verificationDegraded=true"));
     }
 
     #[cfg(unix)]
@@ -14296,6 +14444,47 @@ max_final_review_rounds = 1
             final_fix_task.verification_commands[0].name,
             "final fix marker"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_review_round2_prompt_includes_degraded_final_fix_verification() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let home = temp.path().join("home");
+        init_test_repo(&repo);
+        write_spec_and_commit(&repo, "spec.md");
+
+        let task_file = sample_run_task_file("run", "spec.md", vec![sample_task("p1", 1)]);
+        let store = RunStore::for_repo(&repo, &home).unwrap();
+        store.write_task_file("run", &task_file).unwrap();
+        let mut state = initial_run_state(&task_file);
+        state.tasks[0].status = TaskStatus::Done;
+        state.tasks[0].phase = Some(TaskPhase::Commit);
+        store.write_run_state("run", &state).unwrap();
+
+        let codex = fake_codex_script(
+            temp.path(),
+            &final_review_must_fix_then_approved_with_prompt_capture_script(),
+        );
+        let codex_dir = codex.parent().unwrap().to_path_buf();
+        let result = finalize_run_in_repo(
+            &repo,
+            &home,
+            FinalizeOptions {
+                run_id: Some("run".to_string()),
+                no_cleanup: true,
+                codex_bin: Some(codex),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        let aggregate_prompt =
+            fs::read_to_string(codex_dir.join("round2-aggregate-prompt.log")).unwrap();
+        assert!(aggregate_prompt.contains("final-fix-round-1"));
+        assert!(aggregate_prompt.contains("verificationDegraded=true"));
+        assert!(aggregate_prompt.contains("no global"));
     }
 
     #[cfg(unix)]
@@ -14673,6 +14862,81 @@ if grep -q '^Review output path:' "$script_dir/stdin.log"; then
   exit 0
 fi
 printf 'fixed\n' > "$repo/final-fix.marker"
+printf 'implementation summary\n' > "$last"
+"#
+        .to_string()
+    }
+
+    fn final_review_must_fix_then_approved_with_prompt_capture_script() -> String {
+        r#"
+last=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    last="$1"
+  fi
+  shift || break
+done
+if grep -q '^Findings output path:' "$script_dir/stdin.log"; then
+  out=$(sed -n 's/^Findings output path: //p' "$script_dir/stdin.log" | head -n 1)
+  mkdir -p "$(dirname "$out")"
+  if printf '%s\n' "$out" | grep -q '/round-1/'; then
+    cat > "$out" <<'CODEX_SHARD'
+{
+  "verdict": "CHANGES_REQUESTED",
+  "findings": [
+    {
+      "id": "must-fix",
+      "severity": "MUST_FIX",
+      "title": "Blocking issue",
+      "detail": "Fix the final review issue."
+    }
+  ]
+}
+CODEX_SHARD
+  else
+    printf '{"verdict":"APPROVED","findings":[]}\n' > "$out"
+  fi
+  printf 'final review shard complete\n' > "$last"
+  exit 0
+fi
+if grep -q '^Aggregate review output path:' "$script_dir/stdin.log"; then
+  out=$(sed -n 's/^Aggregate review output path: //p' "$script_dir/stdin.log" | head -n 1)
+  mkdir -p "$(dirname "$out")"
+  if printf '%s\n' "$out" | grep -q '/round-2/'; then
+    cp "$script_dir/stdin.log" "$script_dir/round2-aggregate-prompt.log"
+    verdict="APPROVED"
+    body="Final fix resolved the blocking issue."
+  else
+    verdict="CHANGES_REQUESTED"
+    body="Blocking issues remain."
+  fi
+  cat > "$out" <<CODEX_REVIEW
+---
+verdict: $verdict
+reviewed_at: 2026-06-16T00:00:00Z
+---
+
+$body
+CODEX_REVIEW
+  printf 'final review aggregate complete\n' > "$last"
+  exit 0
+fi
+if grep -q 'Analysis output path:' "$script_dir/stdin.log"; then
+  out=$(sed -n 's/^Analysis output path: //p' "$script_dir/stdin.log" | head -n 1)
+  mkdir -p "$(dirname "$out")"
+  printf 'analysis report\n' > "$out"
+  printf 'analysis complete\n' > "$last"
+  exit 0
+fi
+if grep -q '^Review output path:' "$script_dir/stdin.log"; then
+  out=$(sed -n 's/^Review output path: //p' "$script_dir/stdin.log" | head -n 1)
+  task=$(sed -n 's/^Task: \([^ ]*\) -.*/\1/p' "$script_dir/stdin.log" | head -n 1)
+  mkdir -p "$(dirname "$out")"
+  printf -- '---\ntask_id: %s\nphase: review\nverdict: APPROVED\nreviewed_at: 2026-06-16T00:00:00Z\n---\n\nApproved.\n' "$task" > "$out"
+  printf 'review complete\n' > "$last"
+  exit 0
+fi
 printf 'implementation summary\n' > "$last"
 "#
         .to_string()
