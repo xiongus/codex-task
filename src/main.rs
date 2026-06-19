@@ -312,6 +312,16 @@ fn run(cli: Cli) -> Result<i32, AppError> {
             println!("Spec: {}", result.spec_file);
             println!("Run store: {}", result.run_dir.display());
             println!("Visible run dir: {}", result.visible_run_dir.display());
+            println!("Problem framing: {}", result.problem_status);
+            if let Some(path) = result.options_path {
+                println!("Options: {}", path.display());
+            }
+            if let Some(path) = result.decision_path {
+                println!("Decision: {}", path.display());
+            }
+            if let Some(path) = result.resolved_problem_path {
+                println!("Resolved problem: {}", path.display());
+            }
             println!("Requirement review: {}", result.requirement_status);
             if let Some(path) = result.questions_path {
                 println!("Questions: {}", path.display());
@@ -327,7 +337,9 @@ fn run(cli: Cli) -> Result<i32, AppError> {
             for warning in result.warnings {
                 println!("warning: {warning}");
             }
-            if result.requirement_status == "needs_clarification"
+            if result.problem_status == "needs_decision"
+                || result.problem_status == "failed"
+                || result.requirement_status == "needs_clarification"
                 || result.requirement_status == "failed"
             {
                 Ok(1)
@@ -348,6 +360,10 @@ fn run(cli: Cli) -> Result<i32, AppError> {
             println!("Spec: {}", result.spec_file);
             println!("Run store: {}", result.run_dir.display());
             println!("Visible run dir: {}", result.visible_run_dir.display());
+            println!("Problem framing: {}", result.problem_status);
+            if let Some(path) = result.resolved_problem_path {
+                println!("Resolved problem: {}", path.display());
+            }
             println!("Requirement review: {}", result.requirement_status);
             if let Some(path) = result.resolved_spec_path {
                 println!("Resolved spec: {}", path.display());

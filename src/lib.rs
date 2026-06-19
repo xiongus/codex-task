@@ -260,6 +260,69 @@ impl ReviewVerdict {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum ProblemFramingStatus {
+    #[default]
+    Pending,
+    Running,
+    Clear,
+    NeedsDecision,
+    Resolved,
+    Failed,
+}
+
+impl ProblemFramingStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProblemFramingStatus::Pending => "pending",
+            ProblemFramingStatus::Running => "running",
+            ProblemFramingStatus::Clear => "clear",
+            ProblemFramingStatus::NeedsDecision => "needs_decision",
+            ProblemFramingStatus::Resolved => "resolved",
+            ProblemFramingStatus::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProblemFramingState {
+    #[serde(default)]
+    pub status: ProblemFramingStatus,
+    #[serde(rename = "reviewedAt", default)]
+    pub reviewed_at: Option<String>,
+    #[serde(rename = "resolvedAt", default)]
+    pub resolved_at: Option<String>,
+    #[serde(rename = "optionsPath", default)]
+    pub options_path: Option<String>,
+    #[serde(rename = "decisionPath", default)]
+    pub decision_path: Option<String>,
+    #[serde(rename = "resolvedProblemPath", default)]
+    pub resolved_problem_path: Option<String>,
+    #[serde(default)]
+    pub output: Option<String>,
+    #[serde(rename = "lastError", default)]
+    pub last_error: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl Default for ProblemFramingState {
+    fn default() -> Self {
+        Self {
+            status: ProblemFramingStatus::Pending,
+            reviewed_at: None,
+            resolved_at: None,
+            options_path: None,
+            decision_path: None,
+            resolved_problem_path: None,
+            output: None,
+            last_error: None,
+            extra: Map::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum RequirementReviewStatus {
     #[default]
     Pending,
@@ -1251,6 +1314,10 @@ pub struct StartResult {
     pub tasks_path: PathBuf,
     pub state_path: PathBuf,
     pub metadata_path: PathBuf,
+    pub problem_status: String,
+    pub options_path: Option<PathBuf>,
+    pub decision_path: Option<PathBuf>,
+    pub resolved_problem_path: Option<PathBuf>,
     pub requirement_status: String,
     pub questions_path: Option<PathBuf>,
     pub answers_path: Option<PathBuf>,
@@ -1268,6 +1335,10 @@ pub struct RunMetadata {
     pub branch: String,
     #[serde(rename = "specFile")]
     pub spec_file: String,
+    #[serde(rename = "problemFraming", default)]
+    pub problem_framing: ProblemFramingState,
+    #[serde(rename = "resolvedProblemFile", default)]
+    pub resolved_problem_file: Option<String>,
     #[serde(rename = "requirementReview", default)]
     pub requirement_review: RequirementReviewState,
     #[serde(rename = "resolvedSpecFile", default)]
@@ -1331,9 +1402,13 @@ pub fn resume_run_in_repo(
     }
 
     let mut state = store.read_run_state(&run_id)?;
+    if state.problem_framing.status == ProblemFramingStatus::NeedsDecision {
+        return resume_problem_decision(&context, &store, &run_id, &metadata, options.codex_bin);
+    }
     if state.requirement_review.status != RequirementReviewStatus::NeedsClarification {
         return Err(AppError::Runtime(format!(
-            "run {run_id} is not waiting for requirement answers; status={}",
+            "run {run_id} is not waiting for user input; problemFraming={}, requirementReview={}",
+            state.problem_framing.status.as_str(),
             state.requirement_review.status.as_str()
         )));
     }
@@ -1366,14 +1441,14 @@ pub fn resume_run_in_repo(
         )));
     }
 
-    let original_spec = SpecDocument::read(&context.repo_root.join(&metadata.spec_file))?;
+    let (base_spec_file, original_spec) = active_spec_for_requirement(&context, &metadata, &state)?;
     let resolved_spec_path = visible_dir.join("resolved-spec.md");
     let run_dir = store.run_dir(&run_id)?;
     let prompt = render_resolve_requirement_prompt(ResolveRequirementRender {
         context: &context,
         store: &store,
         run_id: &run_id,
-        spec_file: &metadata.spec_file,
+        spec_file: &base_spec_file,
         spec: &original_spec,
         questions: &questions,
         answers: &answers,
@@ -1452,6 +1527,165 @@ pub fn resume_run_in_repo(
         false,
         warnings,
     )
+}
+
+fn resume_problem_decision(
+    context: &ConfigContext,
+    store: &RunStore,
+    run_id: &str,
+    metadata: &RunMetadata,
+    codex_bin: Option<PathBuf>,
+) -> std::result::Result<StartResult, AppError> {
+    let mut state = store.read_run_state(run_id)?;
+    let visible_dir = project_task_run_dir(&context.repo_root, run_id);
+    let options_path = state
+        .problem_framing
+        .options_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| visible_dir.join("options.md"));
+    let decision_path = state
+        .problem_framing
+        .decision_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| visible_dir.join("decision.md"));
+    let options = fs::read_to_string(&options_path)
+        .map_err(|err| AppError::Io(format!("failed to read {}: {err}", options_path.display())))?;
+    let decision = fs::read_to_string(&decision_path).map_err(|err| {
+        AppError::Io(format!("failed to read {}: {err}", decision_path.display()))
+    })?;
+    if !decision_file_is_filled(&decision) {
+        return Err(AppError::Runtime(format!(
+            "{} has no decision under `## Decision`",
+            decision_path.display()
+        )));
+    }
+
+    let original_spec = SpecDocument::read(&context.repo_root.join(&metadata.spec_file))?;
+    let resolved_problem_path = visible_dir.join("resolved-problem.md");
+    let run_dir = store.run_dir(run_id)?;
+    let prompt = render_resolve_problem_prompt(ResolveProblemRender {
+        context,
+        store,
+        run_id,
+        spec_file: &metadata.spec_file,
+        spec: &original_spec,
+        options: &options,
+        decision: &decision,
+        output_path: &resolved_problem_path,
+    })?;
+    let request = CodexRunRequest {
+        prompt,
+        prompt_path: run_dir.join("prompts/resolve-problem.md"),
+        stdout_log_path: run_dir.join("logs/resolve-problem.stdout.log"),
+        stderr_log_path: run_dir.join("logs/resolve-problem.stderr.log"),
+        last_message_path: run_dir.join("logs/resolve-problem.last-message.md"),
+        required_output_path: Some(resolved_problem_path.clone()),
+        sandbox: context.merged.runner.sandbox.clone(),
+        approval: context.merged.runner.approval.clone(),
+        model: context.merged.runner.model.clone(),
+        reasoning_effort: context.merged.runner.reasoning_effort.clone(),
+        search: Some(context.merged.runner.search),
+        timeout_seconds: context.merged.runner.default_analyze_timeout_seconds,
+    };
+    build_executor(context, codex_bin.clone())
+        .execute(&request)
+        .map_err(|err| {
+            AppError::Runtime(format!(
+                "{err}; logs: stdout={}, stderr={}, last={}",
+                err.stdout_log_path.display(),
+                err.stderr_log_path.display(),
+                err.last_message_path.display()
+            ))
+        })?;
+    let resolved_problem = SpecDocument::read(&resolved_problem_path)?;
+    if resolved_problem.body.trim().is_empty() {
+        return Err(AppError::Runtime(format!(
+            "resolved problem {} is empty",
+            resolved_problem_path.display()
+        )));
+    }
+    let resolved_problem_file =
+        repo_relative_slash_path(&context.repo_root, &resolved_problem_path)?;
+
+    state.problem_framing.status = ProblemFramingStatus::Resolved;
+    state.problem_framing.resolved_at = Some(current_timestamp()?);
+    state.problem_framing.resolved_problem_path = Some(resolved_problem_path.display().to_string());
+    state.problem_framing.last_error = None;
+    store.write_run_state(run_id, &state)?;
+    update_metadata_problem_framing(
+        store,
+        run_id,
+        &state.problem_framing,
+        Some(resolved_problem_file.clone()),
+    )?;
+    append_event_log(
+        &run_dir,
+        &format!(
+            "problem framing decision resolved; resolved_problem={}",
+            resolved_problem_path.display()
+        ),
+    )?;
+
+    let mut warnings = Vec::new();
+    let review_status = run_requirement_review(
+        context,
+        store,
+        run_id,
+        &resolved_problem_file,
+        &resolved_problem,
+        codex_bin.clone(),
+    )?;
+    if review_status != RequirementReviewStatus::Clear {
+        return start_result(
+            context,
+            store,
+            run_id,
+            &metadata.branch,
+            &resolved_problem_file,
+            false,
+            warnings,
+        );
+    }
+
+    run_decompose(DecomposeRun {
+        context,
+        store,
+        run_id,
+        branch: &metadata.branch,
+        spec_file: &resolved_problem_file,
+        spec: &resolved_problem,
+        codex_bin,
+        warnings: &mut warnings,
+    })?;
+
+    start_result(
+        context,
+        store,
+        run_id,
+        &metadata.branch,
+        &resolved_problem_file,
+        false,
+        warnings,
+    )
+}
+
+fn active_spec_for_requirement(
+    context: &ConfigContext,
+    metadata: &RunMetadata,
+    state: &RunState,
+) -> std::result::Result<(String, SpecDocument), AppError> {
+    if state.problem_framing.status == ProblemFramingStatus::Resolved
+        && let Some(path) = &state.problem_framing.resolved_problem_path
+    {
+        let path = PathBuf::from(path);
+        let spec = SpecDocument::read(&path)?;
+        let spec_file = repo_relative_slash_path(&context.repo_root, &path)?;
+        return Ok((spec_file, spec));
+    }
+    let spec = SpecDocument::read(&context.repo_root.join(&metadata.spec_file))?;
+    Ok((metadata.spec_file.clone(), spec))
 }
 
 pub fn start_run_in_repo(
@@ -1564,6 +1798,13 @@ pub fn start_run_in_repo(
         run_id: run_id.clone(),
         branch: branch.clone(),
         spec_file: spec_file.clone(),
+        problem_framing: existing_metadata
+            .as_ref()
+            .map(|metadata| metadata.problem_framing.clone())
+            .unwrap_or_default(),
+        resolved_problem_file: existing_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.resolved_problem_file.clone()),
         requirement_review: existing_metadata
             .as_ref()
             .map(|metadata| metadata.requirement_review.clone())
@@ -1607,6 +1848,20 @@ pub fn start_run_in_repo(
         );
     }
 
+    let problem_status = run_problem_framing(
+        &context,
+        &store,
+        &run_id,
+        &spec_file,
+        &spec,
+        options.codex_bin.clone(),
+    )?;
+    if problem_status != ProblemFramingStatus::Clear {
+        return start_result(
+            &context, &store, &run_id, &branch, &spec_file, false, warnings,
+        );
+    }
+
     let review_status = run_requirement_review(
         &context,
         &store,
@@ -1647,6 +1902,7 @@ fn start_result(
     warnings: Vec<String>,
 ) -> std::result::Result<StartResult, AppError> {
     let state = store.read_run_state(run_id).unwrap_or_default();
+    let problem = state.problem_framing;
     let requirement = state.requirement_review;
     Ok(StartResult {
         run_id: run_id.to_string(),
@@ -1657,6 +1913,10 @@ fn start_result(
         tasks_path: store.tasks_path(run_id)?,
         state_path: store.state_path(run_id)?,
         metadata_path: store.metadata_path(run_id)?,
+        problem_status: problem.status.as_str().to_string(),
+        options_path: problem.options_path.map(PathBuf::from),
+        decision_path: problem.decision_path.map(PathBuf::from),
+        resolved_problem_path: problem.resolved_problem_path.map(PathBuf::from),
         requirement_status: requirement.status.as_str().to_string(),
         questions_path: requirement.questions_path.map(PathBuf::from),
         answers_path: requirement.answers_path.map(PathBuf::from),
@@ -1664,6 +1924,133 @@ fn start_result(
         resumed,
         warnings,
     })
+}
+
+fn run_problem_framing(
+    context: &ConfigContext,
+    store: &RunStore,
+    run_id: &str,
+    spec_file: &str,
+    spec: &SpecDocument,
+    codex_bin: Option<PathBuf>,
+) -> std::result::Result<ProblemFramingStatus, AppError> {
+    let run_dir = store.run_dir(run_id)?;
+    let visible_dir = project_task_run_dir(&context.repo_root, run_id);
+    fs::create_dir_all(&visible_dir).map_err(|err| {
+        AppError::Io(format!(
+            "failed to create visible run directory {}: {err}",
+            visible_dir.display()
+        ))
+    })?;
+
+    let output_path = run_dir.join("output/problem-framing.md");
+    let options_path = visible_dir.join("options.md");
+    let decision_path = visible_dir.join("decision.md");
+    let now = current_timestamp()?;
+    let mut problem = ProblemFramingState {
+        status: ProblemFramingStatus::Running,
+        options_path: Some(options_path.display().to_string()),
+        decision_path: Some(decision_path.display().to_string()),
+        output: Some(output_path.display().to_string()),
+        ..ProblemFramingState::default()
+    };
+    write_problem_framing_state(store, run_id, &problem)?;
+    update_metadata_problem_framing(store, run_id, &problem, None)?;
+
+    let prompt =
+        render_problem_framing_prompt(context, store, run_id, spec_file, spec, &output_path)?;
+    let request = CodexRunRequest {
+        prompt,
+        prompt_path: run_dir.join("prompts/problem-framing.md"),
+        stdout_log_path: run_dir.join("logs/problem-framing.stdout.log"),
+        stderr_log_path: run_dir.join("logs/problem-framing.stderr.log"),
+        last_message_path: run_dir.join("logs/problem-framing.last-message.md"),
+        required_output_path: Some(output_path.clone()),
+        sandbox: context.merged.runner.review_sandbox.clone(),
+        approval: context.merged.runner.approval.clone(),
+        model: context.merged.runner.model.clone(),
+        reasoning_effort: context.merged.runner.reasoning_effort.clone(),
+        search: Some(context.merged.runner.search),
+        timeout_seconds: context.merged.runner.default_review_timeout_seconds,
+    };
+
+    let _output = match build_executor(context, codex_bin).execute(&request) {
+        Ok(output) => output,
+        Err(err) => {
+            let err = *err;
+            let message = err.message.clone();
+            let stdout_log = err.stdout_log_path.clone();
+            let stderr_log = err.stderr_log_path.clone();
+            let last_message = err.last_message_path.clone();
+            problem.status = ProblemFramingStatus::Failed;
+            problem.last_error = Some(message.clone());
+            problem.output = Some(err.stderr_log_path.display().to_string());
+            write_problem_framing_state(store, run_id, &problem)?;
+            update_metadata_problem_framing(store, run_id, &problem, None)?;
+            return Err(AppError::Runtime(format!(
+                "{message}; logs: stdout={}, stderr={}, last={}",
+                stdout_log.display(),
+                stderr_log.display(),
+                last_message.display()
+            )));
+        }
+    };
+
+    let decision = match parse_problem_framing_output_file(&output_path) {
+        Ok(decision) => decision,
+        Err(err) => {
+            problem.status = ProblemFramingStatus::Failed;
+            problem.last_error = Some(err.clone());
+            write_problem_framing_state(store, run_id, &problem)?;
+            update_metadata_problem_framing(store, run_id, &problem, None)?;
+            return Err(AppError::Runtime(format!(
+                "invalid problem framing output: {err}; raw output preserved at {}",
+                output_path.display()
+            )));
+        }
+    };
+
+    problem.status = decision.status;
+    problem.reviewed_at = Some(now);
+    problem.output = Some(output_path.display().to_string());
+    problem.last_error = None;
+
+    match decision.status {
+        ProblemFramingStatus::Clear => {
+            remove_file_if_exists(&options_path).map_err(|err| {
+                AppError::Io(format!(
+                    "failed to remove {}: {err}",
+                    options_path.display()
+                ))
+            })?;
+            remove_file_if_exists(&decision_path).map_err(|err| {
+                AppError::Io(format!(
+                    "failed to remove {}: {err}",
+                    decision_path.display()
+                ))
+            })?;
+            problem.options_path = None;
+            problem.decision_path = None;
+            append_event_log(&run_dir, "problem framing clear")?;
+        }
+        ProblemFramingStatus::NeedsDecision => {
+            write_options_file(&options_path, run_id, &decision.body)?;
+            write_decision_file(&decision_path, run_id, &decision.body)?;
+            append_event_log(
+                &run_dir,
+                &format!(
+                    "problem framing needs decision; options={}, decision={}",
+                    options_path.display(),
+                    decision_path.display()
+                ),
+            )?;
+        }
+        _ => {}
+    }
+
+    write_problem_framing_state(store, run_id, &problem)?;
+    update_metadata_problem_framing(store, run_id, &problem, None)?;
+    Ok(decision.status)
 }
 
 fn run_requirement_review(
@@ -1865,10 +2252,65 @@ fn run_decompose(input: DecomposeRun<'_>) -> std::result::Result<(), AppError> {
     store.write_task_file(run_id, &task_file)?;
     let previous_state = store.read_run_state(run_id).unwrap_or_default();
     let mut next_state = initial_run_state(&task_file);
+    next_state.problem_framing = previous_state.problem_framing;
     next_state.requirement_review = previous_state.requirement_review;
     next_state.final_review = previous_state.final_review;
     store.write_run_state(run_id, &next_state)?;
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProblemFramingDecision {
+    status: ProblemFramingStatus,
+    body: String,
+}
+
+fn parse_problem_framing_output_file(
+    path: &Path,
+) -> std::result::Result<ProblemFramingDecision, String> {
+    let raw = fs::read_to_string(path).map_err(|err| {
+        format!(
+            "failed to read problem framing output {}: {err}",
+            path.display()
+        )
+    })?;
+    let (frontmatter, body) = parse_review_frontmatter(&raw)?;
+    require_reviewed_at(&frontmatter)?;
+    let status = match frontmatter.get("verdict").as_deref() {
+        Some("CLEAR") => ProblemFramingStatus::Clear,
+        Some("NEEDS_DECISION") => ProblemFramingStatus::NeedsDecision,
+        Some(value) => return Err(format!("problem framing verdict={value} is invalid")),
+        None => return Err("problem framing output missing verdict".to_string()),
+    };
+    if status == ProblemFramingStatus::NeedsDecision && body.trim().is_empty() {
+        return Err("problem framing options are empty".to_string());
+    }
+    Ok(ProblemFramingDecision { status, body })
+}
+
+fn write_problem_framing_state(
+    store: &RunStore,
+    run_id: &str,
+    problem: &ProblemFramingState,
+) -> std::result::Result<(), AppError> {
+    store.update_run_state(run_id, |state| {
+        state.problem_framing = problem.clone();
+        Ok(())
+    })
+}
+
+fn update_metadata_problem_framing(
+    store: &RunStore,
+    run_id: &str,
+    problem: &ProblemFramingState,
+    resolved_problem_file: Option<String>,
+) -> std::result::Result<(), AppError> {
+    let mut metadata = store.read_metadata(run_id)?;
+    metadata.problem_framing = problem.clone();
+    if resolved_problem_file.is_some() {
+        metadata.resolved_problem_file = resolved_problem_file;
+    }
+    store.write_metadata(run_id, &metadata)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1929,6 +2371,37 @@ fn project_task_run_dir(repo_root: &Path, run_id: &str) -> PathBuf {
     repo_root.join(".codex/task-runs").join(run_id)
 }
 
+fn write_options_file(
+    path: &Path,
+    run_id: &str,
+    options: &str,
+) -> std::result::Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| AppError::Io(format!("failed to create {}: {err}", parent.display())))?;
+    }
+    let text = format!("# Options for {run_id}\n\n{}\n", options.trim());
+    fs::write(path, text)
+        .map_err(|err| AppError::Io(format!("failed to write {}: {err}", path.display())))
+}
+
+fn write_decision_file(
+    path: &Path,
+    run_id: &str,
+    options: &str,
+) -> std::result::Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| AppError::Io(format!("failed to create {}: {err}", parent.display())))?;
+    }
+    let text = format!(
+        "# Decision for {run_id}\n\nChoose the approach under `## Decision`, then run `codex-task resume --run-id {run_id}`.\n\n## Options\n\n{}\n\n## Decision\n\nTODO\n",
+        options.trim()
+    );
+    fs::write(path, text)
+        .map_err(|err| AppError::Io(format!("failed to write {}: {err}", path.display())))
+}
+
 fn write_questions_file(
     path: &Path,
     run_id: &str,
@@ -1967,6 +2440,15 @@ fn answers_file_is_filled(raw: &str) -> bool {
         .unwrap_or(raw)
         .trim();
     !answer_text.is_empty() && answer_text != "TODO"
+}
+
+fn decision_file_is_filled(raw: &str) -> bool {
+    let decision_text = raw
+        .split_once("## Decision")
+        .map(|(_, decision)| decision)
+        .unwrap_or(raw)
+        .trim();
+    !decision_text.is_empty() && decision_text != "TODO"
 }
 
 #[derive(Debug, Clone)]
@@ -2296,6 +2778,8 @@ fn discover_run_metadata_for_spec(
                 run_id: task_file.run_id,
                 branch: task_file.branch,
                 spec_file: task_file.spec_file,
+                problem_framing: ProblemFramingState::default(),
+                resolved_problem_file: None,
                 requirement_review: RequirementReviewState::default(),
                 resolved_spec_file: None,
                 extra: Map::new(),
@@ -2437,6 +2921,66 @@ fn render_requirement_review_prompt(
         output_review_path: output_path.display().to_string(),
     };
     let template = load_prompt_template(context, PromptTemplateKind::RequirementReview)
+        .map_err(|err| AppError::Config(err.to_string()))?;
+    template
+        .render(&input)
+        .map_err(|err| AppError::Config(err.to_string()))
+}
+
+fn render_problem_framing_prompt(
+    context: &ConfigContext,
+    store: &RunStore,
+    run_id: &str,
+    spec_file: &str,
+    spec: &SpecDocument,
+    output_path: &Path,
+) -> std::result::Result<String, AppError> {
+    let input = ProblemFramingPromptInput {
+        common: common_prompt_variables(context, store, run_id)?,
+        spec_file: spec_file.to_string(),
+        feature_spec: spec.body.clone(),
+        output_review_path: output_path.display().to_string(),
+    };
+    let template = load_prompt_template(context, PromptTemplateKind::ProblemFraming)
+        .map_err(|err| AppError::Config(err.to_string()))?;
+    template
+        .render(&input)
+        .map_err(|err| AppError::Config(err.to_string()))
+}
+
+struct ResolveProblemRender<'a> {
+    context: &'a ConfigContext,
+    store: &'a RunStore,
+    run_id: &'a str,
+    spec_file: &'a str,
+    spec: &'a SpecDocument,
+    options: &'a str,
+    decision: &'a str,
+    output_path: &'a Path,
+}
+
+fn render_resolve_problem_prompt(
+    input: ResolveProblemRender<'_>,
+) -> std::result::Result<String, AppError> {
+    let ResolveProblemRender {
+        context,
+        store,
+        run_id,
+        spec_file,
+        spec,
+        options,
+        decision,
+        output_path,
+    } = input;
+    let input = ResolveProblemPromptInput {
+        common: common_prompt_variables(context, store, run_id)?,
+        spec_file: spec_file.to_string(),
+        feature_spec: spec.body.clone(),
+        options: options.to_string(),
+        decision: decision.to_string(),
+        output_resolved_problem_path: output_path.display().to_string(),
+    };
+    let template = load_prompt_template(context, PromptTemplateKind::ResolveProblem)
         .map_err(|err| AppError::Config(err.to_string()))?;
     template
         .render(&input)
@@ -2609,6 +3153,7 @@ fn ensure_task_file_matches_run(
 fn initial_run_state(task_file: &TaskFile) -> RunState {
     RunState {
         schema_version: 1,
+        problem_framing: ProblemFramingState::default(),
         requirement_review: RequirementReviewState::default(),
         final_review: FinalReviewState::default(),
         feature_review_status: FeatureReviewStatus::Pending,
@@ -2645,6 +3190,8 @@ fn initial_run_state(task_file: &TaskFile) -> RunState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum PromptTemplateKind {
+    ProblemFraming,
+    ResolveProblem,
     RequirementReview,
     ResolveRequirement,
     DecomposeFeature,
@@ -2657,7 +3204,9 @@ pub enum PromptTemplateKind {
 }
 
 impl PromptTemplateKind {
-    pub const ALL: [PromptTemplateKind; 9] = [
+    pub const ALL: [PromptTemplateKind; 11] = [
+        PromptTemplateKind::ProblemFraming,
+        PromptTemplateKind::ResolveProblem,
         PromptTemplateKind::RequirementReview,
         PromptTemplateKind::ResolveRequirement,
         PromptTemplateKind::DecomposeFeature,
@@ -2671,6 +3220,8 @@ impl PromptTemplateKind {
 
     pub fn file_name(self) -> &'static str {
         match self {
+            PromptTemplateKind::ProblemFraming => "problem-framing.md",
+            PromptTemplateKind::ResolveProblem => "resolve-problem.md",
             PromptTemplateKind::RequirementReview => "requirement-review.md",
             PromptTemplateKind::ResolveRequirement => "resolve-requirement.md",
             PromptTemplateKind::DecomposeFeature => "decompose-feature.md",
@@ -2685,6 +3236,8 @@ impl PromptTemplateKind {
 
     pub fn from_file_name(name: &str) -> Option<Self> {
         match name {
+            "problem-framing.md" => Some(Self::ProblemFraming),
+            "resolve-problem.md" => Some(Self::ResolveProblem),
             "requirement-review.md" => Some(Self::RequirementReview),
             "resolve-requirement.md" => Some(Self::ResolveRequirement),
             "decompose-feature.md" => Some(Self::DecomposeFeature),
@@ -2845,6 +3398,24 @@ impl CommonPromptVariables {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProblemFramingPromptInput {
+    pub common: CommonPromptVariables,
+    pub spec_file: String,
+    pub feature_spec: String,
+    pub output_review_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveProblemPromptInput {
+    pub common: CommonPromptVariables,
+    pub spec_file: String,
+    pub feature_spec: String,
+    pub options: String,
+    pub decision: String,
+    pub output_resolved_problem_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequirementReviewPromptInput {
     pub common: CommonPromptVariables,
     pub spec_file: String,
@@ -2957,6 +3528,44 @@ pub struct FinalReviewAggregatePromptInput {
     pub docs_summary: String,
     pub verification_summary: String,
     pub output_review_path: String,
+}
+
+impl PromptTemplateInput for ProblemFramingPromptInput {
+    fn kind(&self) -> PromptTemplateKind {
+        PromptTemplateKind::ProblemFraming
+    }
+
+    fn variables(&self) -> BTreeMap<String, String> {
+        let mut variables = common_variables(&self.common);
+        variables.insert("spec_file".to_string(), self.spec_file.clone());
+        variables.insert("feature_spec".to_string(), self.feature_spec.clone());
+        variables.insert(
+            "output_review_path".to_string(),
+            self.output_review_path.clone(),
+        );
+        insert_compat_aliases(&mut variables);
+        variables
+    }
+}
+
+impl PromptTemplateInput for ResolveProblemPromptInput {
+    fn kind(&self) -> PromptTemplateKind {
+        PromptTemplateKind::ResolveProblem
+    }
+
+    fn variables(&self) -> BTreeMap<String, String> {
+        let mut variables = common_variables(&self.common);
+        variables.insert("spec_file".to_string(), self.spec_file.clone());
+        variables.insert("feature_spec".to_string(), self.feature_spec.clone());
+        variables.insert("options".to_string(), self.options.clone());
+        variables.insert("decision".to_string(), self.decision.clone());
+        variables.insert(
+            "output_resolved_problem_path".to_string(),
+            self.output_resolved_problem_path.clone(),
+        );
+        insert_compat_aliases(&mut variables);
+        variables
+    }
 }
 
 impl PromptTemplateInput for RequirementReviewPromptInput {
@@ -3275,6 +3884,8 @@ fn is_prompt_variable_name(value: &str) -> bool {
 
 fn builtin_prompt_template(kind: PromptTemplateKind) -> &'static str {
     match kind {
+        PromptTemplateKind::ProblemFraming => PROBLEM_FRAMING_TEMPLATE,
+        PromptTemplateKind::ResolveProblem => RESOLVE_PROBLEM_TEMPLATE,
         PromptTemplateKind::RequirementReview => REQUIREMENT_REVIEW_TEMPLATE,
         PromptTemplateKind::ResolveRequirement => RESOLVE_REQUIREMENT_TEMPLATE,
         PromptTemplateKind::DecomposeFeature => DECOMPOSE_FEATURE_TEMPLATE,
@@ -3286,6 +3897,70 @@ fn builtin_prompt_template(kind: PromptTemplateKind) -> &'static str {
         PromptTemplateKind::FinalReviewAggregate => FINAL_REVIEW_AGGREGATE_TEMPLATE,
     }
 }
+
+const PROBLEM_FRAMING_TEMPLATE: &str = r#"# Codex Problem Framing Reviewer
+
+Current date: {date}
+Repository root: {repo_root}
+Spec file: {spec_file}
+Problem framing output path: {output_review_path}
+
+This is a read-only problem framing gate. Do not create tasks and do not modify source code.
+
+Read the project rules from `{agent_rules_path}` and the overview from `{overview_doc}`. Challenge the requested direction before any requirement decomposition happens.
+
+Ask:
+- Is the user describing a real problem, or prematurely prescribing a solution?
+- Does the proposed direction bypass existing architecture, data ownership, permissions, audit, API, DB, or compatibility boundaries?
+- Is there a simpler data structure or workflow that removes special cases?
+- Should the user choose between 2-4 materially different approaches before implementation?
+
+## Repository Map
+```text
+{repo_map}
+```
+
+## Feature Specification
+{feature_spec}
+
+Write a Markdown report to `{output_review_path}` when possible. If the sandbox blocks writes, return the exact report as your final message with no code fences. The report must start with YAML frontmatter:
+
+```markdown
+---
+verdict: CLEAR
+reviewed_at: <RFC3339>
+---
+```
+
+`verdict` must be exactly `CLEAR` or `NEEDS_DECISION`.
+
+Use `CLEAR` only when the requested direction is a sane problem framing and does not need a user decision between approaches.
+
+Use `NEEDS_DECISION` when the user has over-specified a questionable solution, skipped an architectural choice, or must choose between alternatives. The body must contain only concrete options and the decision the user must make.
+"#;
+
+const RESOLVE_PROBLEM_TEMPLATE: &str = r#"# Codex Problem Framing Resolver
+
+Current date: {date}
+Repository root: {repo_root}
+Spec file: {spec_file}
+Resolved problem output path: {output_resolved_problem_path}
+
+This phase resolves a previously blocked problem framing gate. Do not modify source code or task state.
+
+## Original Feature Specification
+{feature_spec}
+
+## Options Presented
+{options}
+
+## User Decision
+{decision}
+
+Write the resolved problem statement to `{output_resolved_problem_path}`. If the sandbox blocks writes, return the complete resolved Markdown problem statement as your final message with no code fences.
+
+The resolved problem must be self-contained, must preserve constraints from the original spec, and must incorporate the selected approach without inventing unrelated scope.
+"#;
 
 const REQUIREMENT_REVIEW_TEMPLATE: &str = r#"# Codex Requirement Reviewer
 
@@ -4578,6 +5253,8 @@ pub struct RunState {
     pub schema_version: u64,
     #[serde(default)]
     pub tasks: Vec<TaskState>,
+    #[serde(rename = "problemFraming", default)]
+    pub problem_framing: ProblemFramingState,
     #[serde(rename = "requirementReview", default)]
     pub requirement_review: RequirementReviewState,
     #[serde(rename = "finalReview", default)]
@@ -4598,6 +5275,7 @@ impl Default for RunState {
         Self {
             schema_version: default_run_state_version(),
             tasks: Vec::new(),
+            problem_framing: ProblemFramingState::default(),
             requirement_review: RequirementReviewState::default(),
             final_review: FinalReviewState::default(),
             feature_review_status: default_feature_review_status(),
@@ -4680,6 +5358,7 @@ pub struct StatusView {
     pub branch: String,
     pub spec_file: String,
     pub run_dir: PathBuf,
+    pub problem_framing_status: String,
     pub requirement_review_status: String,
     pub feature_review_status: String,
     pub feature_review_attempts: u64,
@@ -4703,7 +5382,7 @@ pub struct TaskStatusView {
 }
 
 pub enum StatusResult {
-    View(StatusView),
+    View(Box<StatusView>),
     Message(String),
 }
 
@@ -5407,8 +6086,14 @@ pub fn finalize_run_in_repo(
             break;
         }
 
-        let final_fix_task_id =
-            append_final_fix_task(&store, &run_id, &task_file, round, &outcome.must_fix)?;
+        let final_fix_task_id = append_final_fix_task(
+            &context,
+            &store,
+            &run_id,
+            &task_file,
+            round,
+            &outcome.must_fix,
+        )?;
         record_final_fix_task(&store, &run_id, round, &final_fix_task_id)?;
         match run_final_fix_task(
             &context,
@@ -6183,11 +6868,29 @@ fn final_review_verification_summary(
                         .join(", ")
                 })
                 .unwrap_or_else(|| "(none)".to_string());
+            let skipped = task_state
+                .extra
+                .get("verificationSkipped")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let degraded = task_state
+                .extra
+                .get("verificationDegraded")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let degraded_reason = task_state
+                .extra
+                .get("verificationDegradedReason")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
             lines.push(format!(
-                "- {}: status={}, phase={}, verificationLogs={}",
+                "- {}: status={}, phase={}, verificationSkipped={}, verificationDegraded={}, verificationDegradedReason={}, verificationLogs={}",
                 task.id,
                 task_state.status.as_str(),
                 task_state.phase.map(TaskPhase::as_str).unwrap_or("-"),
+                skipped,
+                degraded,
+                degraded_reason,
                 logs
             ));
         }
@@ -6572,6 +7275,7 @@ fn block_final_review(
 }
 
 fn append_final_fix_task(
+    context: &ConfigContext,
     store: &RunStore,
     run_id: &str,
     task_file: &TaskFile,
@@ -6581,6 +7285,10 @@ fn append_final_fix_task(
     let task_id = format!("final-fix-round-{round}");
     let mut next = task_file.clone();
     next.tasks.retain(|task| task.id != task_id);
+    let inherited_verification_commands = final_fix_inherited_task_verification_commands(task_file);
+    let verification_degraded = context.merged.verification_commands.is_empty()
+        && task_file.verification_commands.is_empty()
+        && inherited_verification_commands.is_empty();
     let priority = next
         .tasks
         .iter()
@@ -6590,6 +7298,18 @@ fn append_final_fix_task(
         + 1;
     let findings_json = serde_json::to_string_pretty(findings)
         .map_err(|err| AppError::Runtime(format!("failed to encode findings: {err}")))?;
+    let mut extra = Map::new();
+    extra.insert("finalReviewRound".to_string(), Value::Number(round.into()));
+    if verification_degraded {
+        extra.insert("verificationDegraded".to_string(), Value::Bool(true));
+        extra.insert(
+            "verificationDegradedReason".to_string(),
+            Value::String(
+                "no global, task-file, or task-level verification commands are configured"
+                    .to_string(),
+            ),
+        );
+    }
     next.tasks.push(Task {
         id: task_id.clone(),
         priority,
@@ -6599,7 +7319,7 @@ fn append_final_fix_task(
         timeout_seconds: None,
         output: format!("output/{task_id}.md"),
         prompt: format!(
-            "Fix only these final review MUST_FIX findings, preserve existing behavior, then summarize the changes.\n\n```json\n{findings_json}\n```"
+            "Fix only these final review MUST_FIX findings, preserve existing behavior, then summarize the changes.\n\nVerification degraded: {verification_degraded}\n\n```json\n{findings_json}\n```"
         ),
         spec_file: Some(task_file.spec_file.clone()),
         depends_on: Vec::new(),
@@ -6612,8 +7332,8 @@ fn append_final_fix_task(
         require_review_approval: false,
         max_review_attempts: 1,
         review_timeout_seconds: None,
-        verification_commands: Vec::new(),
-        extra: Map::new(),
+        verification_commands: inherited_verification_commands,
+        extra,
     });
     store.write_task_file(run_id, &next)?;
     store.update_run_state(run_id, |state| {
@@ -6632,9 +7352,35 @@ fn append_final_fix_task(
     })?;
     append_event_log(
         &store.run_dir(run_id)?,
-        &format!("generated final-fix task {task_id} for round {round}"),
+        &format!(
+            "generated final-fix task {task_id} for round {round}; verification_degraded={verification_degraded}"
+        ),
     )?;
     Ok(task_id)
+}
+
+fn final_fix_inherited_task_verification_commands(
+    task_file: &TaskFile,
+) -> Vec<VerificationCommand> {
+    let mut seen = BTreeSet::new();
+    let mut commands = Vec::new();
+    for task in &task_file.tasks {
+        if task.id.starts_with("final-fix-round-") {
+            continue;
+        }
+        for command in &task.verification_commands {
+            let key = (
+                command.name.clone(),
+                command.command.clone(),
+                command.required,
+                command.timeout_seconds,
+            );
+            if seen.insert(key) {
+                commands.push(command.clone());
+            }
+        }
+    }
+    commands
 }
 
 fn record_final_fix_task(
@@ -6671,7 +7417,7 @@ fn run_final_fix_task(
             run_id,
             task_id,
             codex_bin.clone(),
-            false,
+            true,
             true,
         )?;
         let state = store.read_run_state(run_id)?;
@@ -7062,9 +7808,9 @@ pub fn load_status(
     let task_file = store.read_task_file(&selected_run_id)?;
     let run_state = store.read_run_state(&selected_run_id)?;
 
-    Ok(StatusResult::View(merge_status_view(
+    Ok(StatusResult::View(Box::new(merge_status_view(
         run_dir, task_file, run_state,
-    )?))
+    )?)))
 }
 
 fn select_run_id(
@@ -8818,13 +9564,15 @@ fn path_allowed_by_git_scope(config: &GitConfig, path: &str) -> bool {
 }
 
 fn staged_path_allowed_by_git_scope(config: &GitConfig, path: &str) -> bool {
-    !is_tool_run_store_path(path)
+    !is_tool_collaboration_path(path)
         && !path_matches_any(&config.add_exclude, path)
         && (config.add_include.is_empty() || path_matches_any(&config.add_include, path))
 }
 
-fn is_tool_run_store_path(path: &str) -> bool {
-    path == ".codex/task-runner" || path.starts_with(".codex/task-runner/")
+fn is_tool_collaboration_path(path: &str) -> bool {
+    matches!(path, ".codex/task-runner" | ".codex/task-runs")
+        || path.starts_with(".codex/task-runner/")
+        || path.starts_with(".codex/task-runs/")
 }
 
 fn path_matches_any(patterns: &[String], path: &str) -> bool {
@@ -9428,19 +10176,9 @@ fn enforce_dirty_worktree_policy(
 }
 
 fn git_worktree_dirty(repo_root: &Path) -> std::result::Result<bool, AppError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["status", "--porcelain"])
-        .output()
-        .map_err(|err| AppError::Runtime(format!("failed to run git: {err}")))?;
-    if !output.status.success() {
-        return Err(AppError::Runtime(format_git_error(
-            "git status --porcelain",
-            &output,
-        )));
-    }
-    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+    Ok(git_status_entries(repo_root)?
+        .iter()
+        .any(|entry| !is_tool_collaboration_path(&entry.path)))
 }
 
 fn find_task<'a>(
@@ -10203,6 +10941,7 @@ fn merge_status_view(
         branch: task_file.branch,
         spec_file: task_file.spec_file,
         run_dir,
+        problem_framing_status: run_state.problem_framing.status.as_str().to_string(),
         requirement_review_status: run_state.requirement_review.status.as_str().to_string(),
         feature_review_status: run_state.feature_review_status.as_str().to_string(),
         feature_review_attempts: run_state.feature_review_attempts,
@@ -10240,6 +10979,10 @@ pub fn format_status_text(view: &StatusView) -> String {
     out.push_str(&format!("Branch: {}\n", view.branch));
     out.push_str(&format!("Spec: {}\n", view.spec_file));
     out.push_str(&format!("Run store: {}\n", view.run_dir.display()));
+    out.push_str(&format!(
+        "Problem framing: {}\n",
+        view.problem_framing_status
+    ));
     out.push_str(&format!(
         "Requirement review: {}\n",
         view.requirement_review_status
@@ -10454,6 +11197,20 @@ profile = "team"
         fs::create_dir_all(repo.join(".codex")).unwrap();
         fs::write(repo.join(".codex/task-runner.toml"), "").unwrap();
         let context = load_config(&repo, &home, true).unwrap();
+
+        let problem = load_prompt_template(&context, PromptTemplateKind::ProblemFraming)
+            .unwrap()
+            .render(&sample_problem_framing_input())
+            .unwrap();
+        assert!(problem.contains("Problem framing output path"));
+        assert!(problem.contains("NEEDS_DECISION"));
+
+        let resolve_problem = load_prompt_template(&context, PromptTemplateKind::ResolveProblem)
+            .unwrap()
+            .render(&sample_resolve_problem_input())
+            .unwrap();
+        assert!(resolve_problem.contains("Resolved problem output path"));
+        assert!(resolve_problem.contains("User decision"));
 
         let decompose = load_prompt_template(&context, PromptTemplateKind::DecomposeFeature)
             .unwrap()
@@ -10829,6 +11586,7 @@ printf '   \n' > "{}"
 
         let state = RunState {
             schema_version: 1,
+            problem_framing: ProblemFramingState::default(),
             requirement_review: RequirementReviewState::default(),
             final_review: FinalReviewState::default(),
             feature_review_status: FeatureReviewStatus::Pending,
@@ -10979,6 +11737,7 @@ printf '   \n' > "{}"
         let store = RunStore::for_repo(&repo, &home).unwrap();
         let state = RunState {
             schema_version: 1,
+            problem_framing: ProblemFramingState::default(),
             requirement_review: RequirementReviewState::default(),
             final_review: FinalReviewState::default(),
             feature_review_status: FeatureReviewStatus::Pending,
@@ -11455,6 +12214,142 @@ add_include = ["src/**"]
             fs::read_to_string(run_dir.join("logs/decompose.stderr.log"))
                 .unwrap()
                 .contains("codex failed")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn problem_framing_needs_decision_writes_visible_files_and_no_tasks() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let home = temp.path().join("home");
+        init_test_repo(&repo);
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            repo.join("feature.md"),
+            "# Feature\n\nReplace the auth model with a shortcut.\n",
+        )
+        .unwrap();
+        git(&repo, ["add", "."]);
+        git(&repo, ["commit", "-m", "spec"]);
+
+        let codex = fake_codex_script(
+            temp.path(),
+            &problem_needs_decision_script(
+                "- Option A: keep auth boundaries.\n- Option B: shortcut.",
+            ),
+        );
+        let result = start_run_in_repo(
+            &repo,
+            &home,
+            &repo,
+            StartOptions {
+                spec_path: PathBuf::from("feature.md"),
+                run_id: None,
+                branch: None,
+                resume: false,
+                codex_bin: Some(codex),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.problem_status, "needs_decision");
+        assert_eq!(result.requirement_status, "pending");
+        assert!(!result.tasks_path.exists());
+        let options = result.options_path.unwrap();
+        let decision = result.decision_path.unwrap();
+        assert!(options.starts_with(repo.join(".codex/task-runs/feature")));
+        assert!(decision.starts_with(repo.join(".codex/task-runs/feature")));
+        assert!(fs::read_to_string(&options).unwrap().contains("Option A"));
+        assert!(fs::read_to_string(&decision).unwrap().contains("TODO"));
+
+        let store = RunStore::for_repo(&repo, &home).unwrap();
+        let state = store.read_run_state("feature").unwrap();
+        assert_eq!(
+            state.problem_framing.status,
+            ProblemFramingStatus::NeedsDecision
+        );
+        let metadata = store.read_metadata("feature").unwrap();
+        assert_eq!(
+            metadata.problem_framing.status,
+            ProblemFramingStatus::NeedsDecision
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_after_problem_decision_writes_resolved_problem_and_decomposes() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let home = temp.path().join("home");
+        init_test_repo(&repo);
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            repo.join("feature.md"),
+            "# Feature\n\nReplace the auth model with a shortcut.\n",
+        )
+        .unwrap();
+        git(&repo, ["add", "."]);
+        git(&repo, ["commit", "-m", "spec"]);
+
+        let start_codex = fake_codex_script(
+            temp.path(),
+            &problem_needs_decision_script(
+                "- Option A: keep auth boundaries.\n- Option B: shortcut.",
+            ),
+        );
+        let start = start_run_in_repo(
+            &repo,
+            &home,
+            &repo,
+            StartOptions {
+                spec_path: PathBuf::from("feature.md"),
+                run_id: None,
+                branch: None,
+                resume: false,
+                codex_bin: Some(start_codex),
+            },
+        )
+        .unwrap();
+        let decision_path = start.decision_path.unwrap();
+        fs::write(
+            &decision_path,
+            "# Decision for feature\n\n## Decision\n\nUse Option A and keep auth boundaries.\n",
+        )
+        .unwrap();
+
+        let resolved_problem_file = ".codex/task-runs/feature/resolved-problem.md";
+        let resume_codex = fake_codex_script(
+            temp.path(),
+            &resolve_problem_then_requirement_clear_then_decompose_script(
+                "# Resolved Problem\n\nUse Option A and keep auth boundaries.\n",
+                &sample_decompose_json("feature", "feat/feature", resolved_problem_file),
+            ),
+        );
+        let resumed = resume_run_in_repo(
+            &repo,
+            &home,
+            ResumeOptions {
+                run_id: "feature".to_string(),
+                codex_bin: Some(resume_codex),
+            },
+        )
+        .unwrap();
+
+        assert!(resumed.tasks_path.exists());
+        assert_eq!(resumed.problem_status, "resolved");
+        assert_eq!(resumed.requirement_status, "clear");
+        assert_eq!(resumed.spec_file, resolved_problem_file);
+        assert!(resumed.resolved_problem_path.unwrap().exists());
+        let store = RunStore::for_repo(&repo, &home).unwrap();
+        let task_file = store.read_task_file("feature").unwrap();
+        assert_eq!(task_file.spec_file, resolved_problem_file);
+        let state = store.read_run_state("feature").unwrap();
+        assert_eq!(state.problem_framing.status, ProblemFramingStatus::Resolved);
+        let metadata = store.read_metadata("feature").unwrap();
+        assert_eq!(
+            metadata.resolved_problem_file.as_deref(),
+            Some(resolved_problem_file)
         );
     }
 
@@ -12010,6 +12905,56 @@ commit = true
         let p1 = find_task_state(&state, "p1").unwrap();
         assert_eq!(p1.status, TaskStatus::Pending);
         assert_eq!(p1.attempts, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dirty_worktree_policy_ignores_visible_task_run_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let home = temp.path().join("home");
+        init_test_repo(&repo);
+        fs::write(
+            repo.join(".codex/task-runner.toml"),
+            r#"
+[runner]
+require_clean = true
+allow_dirty_resume = false
+"#,
+        )
+        .unwrap();
+        write_spec_and_commit(&repo, "spec.md");
+
+        let mut task = sample_task("p1", 1);
+        task.analyze_required = false;
+        let task_file = sample_run_task_file("run", "spec.md", vec![task]);
+        let store = RunStore::for_repo(&repo, &home).unwrap();
+        store.write_task_file("run", &task_file).unwrap();
+        let mut state = initial_run_state(&task_file);
+        state.tasks[0].phase = Some(TaskPhase::Implement);
+        store.write_run_state("run", &state).unwrap();
+        fs::create_dir_all(repo.join(".codex/task-runs/run")).unwrap();
+        fs::write(repo.join(".codex/task-runs/run/answers.md"), "answer\n").unwrap();
+
+        let result = run_one_task_in_repo(
+            &repo,
+            &home,
+            RunTaskOptions {
+                run_id: Some("run".to_string()),
+                task_id: "p1".to_string(),
+                from: None,
+                codex_bin: Some(fake_codex_script(
+                    temp.path(),
+                    &phase_aware_success_script(),
+                )),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        let state = store.read_run_state("run").unwrap();
+        let p1 = find_task_state(&state, "p1").unwrap();
+        assert_eq!(p1.attempts, 1);
     }
 
     #[cfg(unix)]
@@ -12944,7 +13889,14 @@ add_required = false
         state.tasks[0].phase = Some(TaskPhase::Commit);
         state.tasks[0].last_verdict = Some(ReviewVerdict::Approved);
         store.write_run_state("run", &state).unwrap();
+        fs::create_dir_all(repo.join(".codex/task-runs/run")).unwrap();
+        fs::write(
+            repo.join(".codex/task-runs/run/questions.md"),
+            "visible collaboration file\n",
+        )
+        .unwrap();
         git(&repo, ["add", ".codex/task-runner"]);
+        git(&repo, ["add", ".codex/task-runs"]);
 
         let result = run_one_task_in_repo(
             &repo,
@@ -12975,9 +13927,20 @@ add_required = false
                 .contains(".codex/task-runner")
         );
         assert!(
+            p1.last_error
+                .as_deref()
+                .unwrap()
+                .contains(".codex/task-runs")
+        );
+        assert!(
             git_output(&repo, &["diff", "--cached", "--name-only"])
                 .unwrap()
                 .contains(".codex/task-runner")
+        );
+        assert!(
+            git_output(&repo, &["diff", "--cached", "--name-only"])
+                .unwrap()
+                .contains(".codex/task-runs")
         );
     }
 
@@ -13003,6 +13966,12 @@ add_include = [".codex/**", "src/**"]
         let task_file = sample_run_task_file("run", "spec.md", vec![sample_task("p1", 1)]);
         let store = RunStore::for_repo(&repo, &repo).unwrap();
         store.write_task_file("run", &task_file).unwrap();
+        fs::create_dir_all(repo.join(".codex/task-runs/run")).unwrap();
+        fs::write(
+            repo.join(".codex/task-runs/run/questions.md"),
+            "visible collaboration file\n",
+        )
+        .unwrap();
         let mut state = initial_run_state(&task_file);
         state.tasks[0].status = TaskStatus::Reviewed;
         state.tasks[0].phase = Some(TaskPhase::Commit);
@@ -13026,10 +13995,16 @@ add_include = [".codex/**", "src/**"]
             git_output(&repo, &["show", "--name-only", "--format=", "HEAD"]).unwrap();
         assert!(committed_files.contains("src/lib.rs"));
         assert!(!committed_files.contains(".codex/task-runner/runs"));
+        assert!(!committed_files.contains(".codex/task-runs"));
         assert!(
             git_output(&repo, &["status", "--porcelain", "--untracked-files=all"],)
                 .unwrap()
                 .contains(".codex/task-runner/runs")
+        );
+        assert!(
+            git_output(&repo, &["status", "--porcelain", "--untracked-files=all"],)
+                .unwrap()
+                .contains(".codex/task-runs")
         );
     }
 
@@ -13177,6 +14152,149 @@ max_final_review_rounds = 1
                 .and_then(Value::as_str)
                 .unwrap()
                 .contains("remaining MUST_FIX")
+        );
+    }
+
+    #[test]
+    fn final_fix_without_available_verification_is_marked_degraded() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let home = temp.path().join("home");
+        fs::create_dir_all(repo.join(".codex")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::write(repo.join(".codex/task-runner.toml"), "").unwrap();
+        fs::write(repo.join("spec.md"), "# Spec\n").unwrap();
+
+        let context = load_config(&repo, &home, true).unwrap();
+        let task_file = sample_run_task_file("run", "spec.md", vec![sample_task("p1", 1)]);
+        let store = RunStore::for_repo(&repo, &home).unwrap();
+        store.write_task_file("run", &task_file).unwrap();
+        store
+            .write_run_state("run", &initial_run_state(&task_file))
+            .unwrap();
+
+        let task_id = append_final_fix_task(
+            &context,
+            &store,
+            "run",
+            &task_file,
+            1,
+            &[FinalReviewFinding {
+                id: "must-fix".to_string(),
+                review_type: "code-defect".to_string(),
+                severity: FindingSeverity::MustFix,
+                title: "Blocking issue".to_string(),
+                detail: "Fix it.".to_string(),
+                source: None,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(task_id, "final-fix-round-1");
+        let updated = store.read_task_file("run").unwrap();
+        let final_fix = updated
+            .tasks
+            .iter()
+            .find(|task| task.id == "final-fix-round-1")
+            .unwrap();
+        assert!(final_fix.verification_commands.is_empty());
+        assert_eq!(
+            final_fix
+                .extra
+                .get("verificationDegraded")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            final_fix
+                .extra
+                .get("verificationDegradedReason")
+                .and_then(Value::as_str)
+                .unwrap()
+                .contains("no global")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_review_must_fix_runs_final_fix_then_approves_next_round() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let home = temp.path().join("home");
+        init_test_repo(&repo);
+        write_spec_and_commit(&repo, "spec.md");
+
+        let mut task = sample_task("p1", 1);
+        task.verification_commands = vec![verification_command(
+            "final fix marker",
+            "test -f final-fix.marker",
+            true,
+            Some(5),
+        )];
+        let task_file = sample_run_task_file("run", "spec.md", vec![task]);
+        let store = RunStore::for_repo(&repo, &home).unwrap();
+        store.write_task_file("run", &task_file).unwrap();
+        let mut state = initial_run_state(&task_file);
+        state.tasks[0].status = TaskStatus::Done;
+        state.tasks[0].phase = Some(TaskPhase::Commit);
+        store.write_run_state("run", &state).unwrap();
+
+        let codex = fake_codex_script(temp.path(), &final_review_must_fix_then_approved_script());
+        let result = finalize_run_in_repo(
+            &repo,
+            &home,
+            FinalizeOptions {
+                run_id: Some("run".to_string()),
+                no_cleanup: true,
+                codex_bin: Some(codex),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert!(repo.join("final-fix.marker").exists());
+        let state = store.read_run_state("run").unwrap();
+        assert_eq!(state.feature_review_status, FeatureReviewStatus::Approved);
+        assert_eq!(state.feature_review_attempts, 2);
+        assert_eq!(state.final_review.rounds.len(), 2);
+        assert_eq!(
+            state.final_review.rounds[0].final_fix_task_id.as_deref(),
+            Some("final-fix-round-1")
+        );
+        assert_eq!(
+            state.final_review.rounds[1].status,
+            FeatureReviewStatus::Approved
+        );
+        let final_fix_state = find_task_state(&state, "final-fix-round-1").unwrap();
+        assert_eq!(final_fix_state.status, TaskStatus::Done);
+        assert_eq!(
+            final_fix_state
+                .extra
+                .get("verificationDegraded")
+                .and_then(Value::as_bool),
+            None
+        );
+        assert!(
+            final_fix_state
+                .extra
+                .get("verificationLogs")
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|path| path.contains("final-fix-marker"))
+        );
+
+        let updated_tasks = store.read_task_file("run").unwrap();
+        let final_fix_task = updated_tasks
+            .tasks
+            .iter()
+            .find(|task| task.id == "final-fix-round-1")
+            .unwrap();
+        assert_eq!(final_fix_task.verification_commands.len(), 1);
+        assert_eq!(
+            final_fix_task.verification_commands[0].name,
+            "final fix marker"
         );
     }
 
@@ -13481,6 +14599,85 @@ printf 'review complete\n' > "$last"
         )
     }
 
+    fn final_review_must_fix_then_approved_script() -> String {
+        r#"
+last=""
+repo=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    last="$1"
+  elif [ "$1" = "-C" ]; then
+    shift
+    repo="$1"
+  fi
+  shift || break
+done
+if grep -q '^Findings output path:' "$script_dir/stdin.log"; then
+  out=$(sed -n 's/^Findings output path: //p' "$script_dir/stdin.log" | head -n 1)
+  mkdir -p "$(dirname "$out")"
+  if printf '%s\n' "$out" | grep -q '/round-1/'; then
+    cat > "$out" <<'CODEX_SHARD'
+{
+  "verdict": "CHANGES_REQUESTED",
+  "findings": [
+    {
+      "id": "must-fix",
+      "severity": "MUST_FIX",
+      "title": "Blocking issue",
+      "detail": "Write the final-fix marker."
+    }
+  ]
+}
+CODEX_SHARD
+  else
+    printf '{"verdict":"APPROVED","findings":[]}\n' > "$out"
+  fi
+  printf 'final review shard complete\n' > "$last"
+  exit 0
+fi
+if grep -q '^Aggregate review output path:' "$script_dir/stdin.log"; then
+  out=$(sed -n 's/^Aggregate review output path: //p' "$script_dir/stdin.log" | head -n 1)
+  mkdir -p "$(dirname "$out")"
+  if printf '%s\n' "$out" | grep -q '/round-1/'; then
+    verdict="CHANGES_REQUESTED"
+    body="Blocking issues remain."
+  else
+    verdict="APPROVED"
+    body="Final fix resolved the blocking issue."
+  fi
+  cat > "$out" <<CODEX_REVIEW
+---
+verdict: $verdict
+reviewed_at: 2026-06-16T00:00:00Z
+---
+
+$body
+CODEX_REVIEW
+  printf 'final review aggregate complete\n' > "$last"
+  exit 0
+fi
+if grep -q 'Analysis output path:' "$script_dir/stdin.log"; then
+  out=$(sed -n 's/^Analysis output path: //p' "$script_dir/stdin.log" | head -n 1)
+  mkdir -p "$(dirname "$out")"
+  printf 'analysis report\n' > "$out"
+  printf 'analysis complete\n' > "$last"
+  exit 0
+fi
+if grep -q '^Review output path:' "$script_dir/stdin.log"; then
+  out=$(sed -n 's/^Review output path: //p' "$script_dir/stdin.log" | head -n 1)
+  task=$(sed -n 's/^Task: \([^ ]*\) -.*/\1/p' "$script_dir/stdin.log" | head -n 1)
+  mkdir -p "$(dirname "$out")"
+  printf -- '---\ntask_id: %s\nphase: review\nverdict: APPROVED\nreviewed_at: 2026-06-16T00:00:00Z\n---\n\nApproved.\n' "$task" > "$out"
+  printf 'review complete\n' > "$last"
+  exit 0
+fi
+printf 'fixed\n' > "$repo/final-fix.marker"
+printf 'implementation summary\n' > "$last"
+"#
+        .to_string()
+    }
+
     fn final_review_script(
         shard_json: &str,
         aggregate_verdict: &str,
@@ -13625,6 +14822,26 @@ printf 'implementation summary\n' > "$last"
             run_id: "run-1".to_string(),
             branch: "feat/run-1".to_string(),
             output_tasks_path: "/runs/run-1/tasks.json".to_string(),
+        }
+    }
+
+    fn sample_problem_framing_input() -> ProblemFramingPromptInput {
+        ProblemFramingPromptInput {
+            common: sample_common_variables(),
+            spec_file: "docs/roadmap/feature.md".to_string(),
+            feature_spec: "Feature body".to_string(),
+            output_review_path: "output/problem-framing.md".to_string(),
+        }
+    }
+
+    fn sample_resolve_problem_input() -> ResolveProblemPromptInput {
+        ResolveProblemPromptInput {
+            common: sample_common_variables(),
+            spec_file: "docs/roadmap/feature.md".to_string(),
+            feature_spec: "Feature body".to_string(),
+            options: "Options".to_string(),
+            decision: "User decision".to_string(),
+            output_resolved_problem_path: ".codex/task-runs/run-1/resolved-problem.md".to_string(),
         }
     }
 
@@ -13824,6 +15041,20 @@ while [ "$#" -gt 0 ]; do
   fi
   shift || break
 done
+if grep -q '^Problem framing output path:' "$script_dir/stdin.log"; then
+  out=$(sed -n 's/^Problem framing output path: //p' "$script_dir/stdin.log" | head -n 1)
+  mkdir -p "$(dirname "$out")"
+  cat > "$out" <<'CODEX_PROBLEM'
+---
+verdict: CLEAR
+reviewed_at: 2026-06-16T00:00:00Z
+---
+
+Clear.
+CODEX_PROBLEM
+  printf 'problem framing clear\n' > "$last"
+  exit 0
+fi
 if grep -q '^Requirement review output path:' "$script_dir/stdin.log"; then
   out=$(sed -n 's/^Requirement review output path: //p' "$script_dir/stdin.log" | head -n 1)
   mkdir -p "$(dirname "$out")"
@@ -13855,6 +15086,20 @@ while [ "$#" -gt 0 ]; do
   fi
   shift || break
 done
+if grep -q '^Problem framing output path:' "$script_dir/stdin.log"; then
+  out=$(sed -n 's/^Problem framing output path: //p' "$script_dir/stdin.log" | head -n 1)
+  mkdir -p "$(dirname "$out")"
+  cat > "$out" <<'CODEX_PROBLEM'
+---
+verdict: CLEAR
+reviewed_at: 2026-06-16T00:00:00Z
+---
+
+Clear.
+CODEX_PROBLEM
+  printf 'problem framing clear\n' > "$last"
+  exit 0
+fi
 if grep -q '^Requirement review output path:' "$script_dir/stdin.log"; then
   out=$(sed -n 's/^Requirement review output path: //p' "$script_dir/stdin.log" | head -n 1)
   mkdir -p "$(dirname "$out")"
@@ -13886,6 +15131,20 @@ while [ "$#" -gt 0 ]; do
   fi
   shift || break
 done
+if grep -q '^Problem framing output path:' "$script_dir/stdin.log"; then
+  out=$(sed -n 's/^Problem framing output path: //p' "$script_dir/stdin.log" | head -n 1)
+  mkdir -p "$(dirname "$out")"
+  cat > "$out" <<'CODEX_PROBLEM'
+---
+verdict: CLEAR
+reviewed_at: 2026-06-16T00:00:00Z
+---
+
+Clear.
+CODEX_PROBLEM
+  printf 'problem framing clear\n' > "$last"
+  exit 0
+fi
 out=$(sed -n 's/^Requirement review output path: //p' "$script_dir/stdin.log" | head -n 1)
 mkdir -p "$(dirname "$out")"
 cat > "$out" <<'CODEX_REQUIREMENT'
@@ -13897,6 +15156,76 @@ reviewed_at: 2026-06-16T00:00:00Z
 {questions}
 CODEX_REQUIREMENT
 printf 'requirement needs clarification\n' > "$last"
+"#
+        )
+    }
+
+    #[cfg(unix)]
+    fn problem_needs_decision_script(options: &str) -> String {
+        format!(
+            r#"last=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    last="$1"
+  fi
+  shift || break
+done
+out=$(sed -n 's/^Problem framing output path: //p' "$script_dir/stdin.log" | head -n 1)
+mkdir -p "$(dirname "$out")"
+cat > "$out" <<'CODEX_PROBLEM'
+---
+verdict: NEEDS_DECISION
+reviewed_at: 2026-06-16T00:00:00Z
+---
+
+{options}
+CODEX_PROBLEM
+printf 'problem framing needs decision\n' > "$last"
+"#
+        )
+    }
+
+    #[cfg(unix)]
+    fn resolve_problem_then_requirement_clear_then_decompose_script(
+        resolved_problem: &str,
+        decompose_json: &str,
+    ) -> String {
+        format!(
+            r#"last=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    last="$1"
+  fi
+  shift || break
+done
+if grep -q '^Resolved problem output path:' "$script_dir/stdin.log"; then
+  out=$(sed -n 's/^Resolved problem output path: //p' "$script_dir/stdin.log" | head -n 1)
+  mkdir -p "$(dirname "$out")"
+  cat > "$out" <<'CODEX_RESOLVED_PROBLEM'
+{resolved_problem}
+CODEX_RESOLVED_PROBLEM
+  printf 'resolved problem\n' > "$last"
+  exit 0
+fi
+if grep -q '^Requirement review output path:' "$script_dir/stdin.log"; then
+  out=$(sed -n 's/^Requirement review output path: //p' "$script_dir/stdin.log" | head -n 1)
+  mkdir -p "$(dirname "$out")"
+  cat > "$out" <<'CODEX_REQUIREMENT'
+---
+verdict: CLEAR
+reviewed_at: 2026-06-16T00:00:00Z
+---
+
+Clear.
+CODEX_REQUIREMENT
+  printf 'requirement clear\n' > "$last"
+  exit 0
+fi
+cat > "$last" <<'CODEX_DECOMPOSE'
+{decompose_json}
+CODEX_DECOMPOSE
 "#
         )
     }
