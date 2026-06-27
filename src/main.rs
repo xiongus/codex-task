@@ -313,9 +313,6 @@ fn run(cli: Cli) -> Result<i32, AppError> {
             println!("Run store: {}", result.run_dir.display());
             println!("Visible run dir: {}", result.visible_run_dir.display());
             println!("Problem framing: {}", result.problem_status);
-            if let Some(path) = result.options_path {
-                println!("Options: {}", path.display());
-            }
             if let Some(path) = result.decision_path {
                 println!("Decision: {}", path.display());
             }

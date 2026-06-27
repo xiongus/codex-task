@@ -14,17 +14,17 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 
-pub const PROMPT_TEMPLATE_NAMES: [&str; 9] = [
-    "requirement-review.md",
-    "resolve-requirement.md",
-    "decompose-feature.md",
-    "analyze-task.md",
-    "implement-task.md",
-    "review-task.md",
-    "review-feature.md",
-    "final-review-shard.md",
-    "final-review-aggregate.md",
-];
+pub const PROMPT_TEMPLATE_NAMES: [&str; PromptTemplateKind::ALL.len()] = prompt_template_names();
+
+const fn prompt_template_names() -> [&'static str; PromptTemplateKind::ALL.len()] {
+    let mut names = [""; PromptTemplateKind::ALL.len()];
+    let mut index = 0;
+    while index < PromptTemplateKind::ALL.len() {
+        names[index] = PromptTemplateKind::ALL[index].file_name();
+        index += 1;
+    }
+    names
+}
 
 const FINAL_REVIEW_TYPES: [&str; 9] = [
     "architecture/integration",
@@ -291,8 +291,6 @@ pub struct ProblemFramingState {
     pub reviewed_at: Option<String>,
     #[serde(rename = "resolvedAt", default)]
     pub resolved_at: Option<String>,
-    #[serde(rename = "optionsPath", default)]
-    pub options_path: Option<String>,
     #[serde(rename = "decisionPath", default)]
     pub decision_path: Option<String>,
     #[serde(rename = "resolvedProblemPath", default)]
@@ -311,7 +309,6 @@ impl Default for ProblemFramingState {
             status: ProblemFramingStatus::Pending,
             reviewed_at: None,
             resolved_at: None,
-            options_path: None,
             decision_path: None,
             resolved_problem_path: None,
             output: None,
@@ -1315,7 +1312,6 @@ pub struct StartResult {
     pub state_path: PathBuf,
     pub metadata_path: PathBuf,
     pub problem_status: String,
-    pub options_path: Option<PathBuf>,
     pub decision_path: Option<PathBuf>,
     pub resolved_problem_path: Option<PathBuf>,
     pub requirement_status: String,
@@ -1405,6 +1401,17 @@ pub fn resume_run_in_repo(
     if state.problem_framing.status == ProblemFramingStatus::NeedsDecision {
         return resume_problem_decision(&context, &store, &run_id, &metadata, options.codex_bin);
     }
+    if state.problem_framing.status == ProblemFramingStatus::Resolved
+        && state.requirement_review.status == RequirementReviewStatus::Clear
+    {
+        return resume_decompose_after_reviews_clear(
+            &context,
+            &store,
+            &run_id,
+            &metadata,
+            options.codex_bin,
+        );
+    }
     if state.requirement_review.status != RequirementReviewStatus::NeedsClarification {
         return Err(AppError::Runtime(format!(
             "run {run_id} is not waiting for user input; problemFraming={}, requirementReview={}",
@@ -1461,6 +1468,7 @@ pub fn resume_run_in_repo(
         stderr_log_path: run_dir.join("logs/resolve-requirement.stderr.log"),
         last_message_path: run_dir.join("logs/resolve-requirement.last-message.md"),
         required_output_path: Some(resolved_spec_path.clone()),
+        fallback_required_output_from_last_message: true,
         sandbox: context.merged.runner.sandbox.clone(),
         approval: context.merged.runner.approval.clone(),
         model: context.merged.runner.model.clone(),
@@ -1538,20 +1546,12 @@ fn resume_problem_decision(
 ) -> std::result::Result<StartResult, AppError> {
     let mut state = store.read_run_state(run_id)?;
     let visible_dir = project_task_run_dir(&context.repo_root, run_id);
-    let options_path = state
-        .problem_framing
-        .options_path
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| visible_dir.join("options.md"));
     let decision_path = state
         .problem_framing
         .decision_path
         .as_deref()
         .map(PathBuf::from)
         .unwrap_or_else(|| visible_dir.join("decision.md"));
-    let options = fs::read_to_string(&options_path)
-        .map_err(|err| AppError::Io(format!("failed to read {}: {err}", options_path.display())))?;
     let decision = fs::read_to_string(&decision_path).map_err(|err| {
         AppError::Io(format!("failed to read {}: {err}", decision_path.display()))
     })?;
@@ -1561,6 +1561,7 @@ fn resume_problem_decision(
             decision_path.display()
         )));
     }
+    let options = decision_file_options(&decision)?;
 
     let original_spec = SpecDocument::read(&context.repo_root.join(&metadata.spec_file))?;
     let resolved_problem_path = visible_dir.join("resolved-problem.md");
@@ -1582,6 +1583,7 @@ fn resume_problem_decision(
         stderr_log_path: run_dir.join("logs/resolve-problem.stderr.log"),
         last_message_path: run_dir.join("logs/resolve-problem.last-message.md"),
         required_output_path: Some(resolved_problem_path.clone()),
+        fallback_required_output_from_last_message: true,
         sandbox: context.merged.runner.sandbox.clone(),
         approval: context.merged.runner.approval.clone(),
         model: context.merged.runner.model.clone(),
@@ -1671,6 +1673,42 @@ fn resume_problem_decision(
     )
 }
 
+fn resume_decompose_after_reviews_clear(
+    context: &ConfigContext,
+    store: &RunStore,
+    run_id: &str,
+    metadata: &RunMetadata,
+    codex_bin: Option<PathBuf>,
+) -> std::result::Result<StartResult, AppError> {
+    let run_dir = store.run_dir(run_id)?;
+    let (spec_file, spec) = active_spec_for_decompose(context, metadata)?;
+    let mut warnings = Vec::new();
+    append_event_log(
+        &run_dir,
+        &format!("resuming task decomposition; spec={spec_file}"),
+    )?;
+    run_decompose(DecomposeRun {
+        context,
+        store,
+        run_id,
+        branch: &metadata.branch,
+        spec_file: &spec_file,
+        spec: &spec,
+        codex_bin,
+        warnings: &mut warnings,
+    })?;
+
+    start_result(
+        context,
+        store,
+        run_id,
+        &metadata.branch,
+        &spec_file,
+        true,
+        warnings,
+    )
+}
+
 fn active_spec_for_requirement(
     context: &ConfigContext,
     metadata: &RunMetadata,
@@ -1683,6 +1721,22 @@ fn active_spec_for_requirement(
         let spec = SpecDocument::read(&path)?;
         let spec_file = repo_relative_slash_path(&context.repo_root, &path)?;
         return Ok((spec_file, spec));
+    }
+    let spec = SpecDocument::read(&context.repo_root.join(&metadata.spec_file))?;
+    Ok((metadata.spec_file.clone(), spec))
+}
+
+fn active_spec_for_decompose(
+    context: &ConfigContext,
+    metadata: &RunMetadata,
+) -> std::result::Result<(String, SpecDocument), AppError> {
+    if let Some(spec_file) = &metadata.resolved_spec_file {
+        let spec = SpecDocument::read(&context.repo_root.join(spec_file))?;
+        return Ok((spec_file.clone(), spec));
+    }
+    if let Some(spec_file) = &metadata.resolved_problem_file {
+        let spec = SpecDocument::read(&context.repo_root.join(spec_file))?;
+        return Ok((spec_file.clone(), spec));
     }
     let spec = SpecDocument::read(&context.repo_root.join(&metadata.spec_file))?;
     Ok((metadata.spec_file.clone(), spec))
@@ -1914,7 +1968,6 @@ fn start_result(
         state_path: store.state_path(run_id)?,
         metadata_path: store.metadata_path(run_id)?,
         problem_status: problem.status.as_str().to_string(),
-        options_path: problem.options_path.map(PathBuf::from),
         decision_path: problem.decision_path.map(PathBuf::from),
         resolved_problem_path: problem.resolved_problem_path.map(PathBuf::from),
         requirement_status: requirement.status.as_str().to_string(),
@@ -1944,12 +1997,10 @@ fn run_problem_framing(
     })?;
 
     let output_path = run_dir.join("output/problem-framing.md");
-    let options_path = visible_dir.join("options.md");
     let decision_path = visible_dir.join("decision.md");
     let now = current_timestamp()?;
     let mut problem = ProblemFramingState {
         status: ProblemFramingStatus::Running,
-        options_path: Some(options_path.display().to_string()),
         decision_path: Some(decision_path.display().to_string()),
         output: Some(output_path.display().to_string()),
         ..ProblemFramingState::default()
@@ -1966,6 +2017,7 @@ fn run_problem_framing(
         stderr_log_path: run_dir.join("logs/problem-framing.stderr.log"),
         last_message_path: run_dir.join("logs/problem-framing.last-message.md"),
         required_output_path: Some(output_path.clone()),
+        fallback_required_output_from_last_message: true,
         sandbox: context.merged.runner.review_sandbox.clone(),
         approval: context.merged.runner.approval.clone(),
         model: context.merged.runner.model.clone(),
@@ -2017,30 +2069,21 @@ fn run_problem_framing(
 
     match decision.status {
         ProblemFramingStatus::Clear => {
-            remove_file_if_exists(&options_path).map_err(|err| {
-                AppError::Io(format!(
-                    "failed to remove {}: {err}",
-                    options_path.display()
-                ))
-            })?;
             remove_file_if_exists(&decision_path).map_err(|err| {
                 AppError::Io(format!(
                     "failed to remove {}: {err}",
                     decision_path.display()
                 ))
             })?;
-            problem.options_path = None;
             problem.decision_path = None;
             append_event_log(&run_dir, "problem framing clear")?;
         }
         ProblemFramingStatus::NeedsDecision => {
-            write_options_file(&options_path, run_id, &decision.body)?;
             write_decision_file(&decision_path, run_id, &decision.body)?;
             append_event_log(
                 &run_dir,
                 &format!(
-                    "problem framing needs decision; options={}, decision={}",
-                    options_path.display(),
+                    "problem framing needs decision; decision={}",
                     decision_path.display()
                 ),
             )?;
@@ -2093,6 +2136,7 @@ fn run_requirement_review(
         stderr_log_path: run_dir.join("logs/requirement-review.stderr.log"),
         last_message_path: run_dir.join("logs/requirement-review.last-message.md"),
         required_output_path: Some(output_path.clone()),
+        fallback_required_output_from_last_message: true,
         sandbox: context.merged.runner.review_sandbox.clone(),
         approval: context.merged.runner.approval.clone(),
         model: context.merged.runner.model.clone(),
@@ -2211,6 +2255,7 @@ fn run_decompose(input: DecomposeRun<'_>) -> std::result::Result<(), AppError> {
         stderr_log_path: run_dir.join("logs/decompose.stderr.log"),
         last_message_path: run_dir.join("last-message.md"),
         required_output_path: None,
+        fallback_required_output_from_last_message: false,
         sandbox: context.merged.runner.sandbox.clone(),
         approval: context.merged.runner.approval.clone(),
         model: context.merged.runner.model.clone(),
@@ -2371,20 +2416,6 @@ fn project_task_run_dir(repo_root: &Path, run_id: &str) -> PathBuf {
     repo_root.join(".codex/task-runs").join(run_id)
 }
 
-fn write_options_file(
-    path: &Path,
-    run_id: &str,
-    options: &str,
-) -> std::result::Result<(), AppError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| AppError::Io(format!("failed to create {}: {err}", parent.display())))?;
-    }
-    let text = format!("# Options for {run_id}\n\n{}\n", options.trim());
-    fs::write(path, text)
-        .map_err(|err| AppError::Io(format!("failed to write {}: {err}", path.display())))
-}
-
 fn write_decision_file(
     path: &Path,
     run_id: &str,
@@ -2439,6 +2470,44 @@ fn answers_file_is_filled(raw: &str) -> bool {
 
 fn decision_file_is_filled(raw: &str) -> bool {
     marker_section(raw, "decision").is_some_and(section_is_filled)
+}
+
+fn decision_file_options(raw: &str) -> std::result::Result<String, AppError> {
+    let options = markdown_section_between(raw, "Options", "Decision")
+        .ok_or_else(|| AppError::Config("decision file missing ## Options section".to_string()))?;
+    if options.is_empty() {
+        return Err(AppError::Config(
+            "decision file options section is empty".to_string(),
+        ));
+    }
+    Ok(options)
+}
+
+fn markdown_section_between(raw: &str, start_heading: &str, end_heading: &str) -> Option<String> {
+    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let mut in_section = false;
+    let mut out = Vec::new();
+    for line in normalized.lines() {
+        if markdown_h2_is(line, start_heading) {
+            in_section = true;
+            out.clear();
+            continue;
+        }
+        if in_section && markdown_h2_is(line, end_heading) {
+            return Some(out.join("\n").trim().to_string());
+        }
+        if in_section {
+            out.push(line);
+        }
+    }
+    None
+}
+
+fn markdown_h2_is(line: &str, name: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed
+        .strip_prefix("##")
+        .is_some_and(|rest| !rest.starts_with('#') && rest.trim() == name)
 }
 
 fn marker_section<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
@@ -2729,6 +2798,47 @@ fn repo_relative_slash_path(
     Ok(path_to_slash(relative))
 }
 
+fn repo_relative_slash_path_for_output(
+    repo_root: &Path,
+    path: &Path,
+) -> std::result::Result<String, AppError> {
+    let repo = repo_root.canonicalize().map_err(|err| {
+        AppError::Io(format!(
+            "failed to canonicalize repo root {}: {err}",
+            repo_root.display()
+        ))
+    })?;
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root.join(path)
+    };
+    let parent = absolute.parent().ok_or_else(|| {
+        AppError::Config(format!("output path has no parent: {}", absolute.display()))
+    })?;
+    let file_name = absolute.file_name().ok_or_else(|| {
+        AppError::Config(format!(
+            "output path has no file name: {}",
+            absolute.display()
+        ))
+    })?;
+    let parent = parent.canonicalize().map_err(|err| {
+        AppError::Io(format!(
+            "failed to canonicalize output parent {}: {err}",
+            parent.display()
+        ))
+    })?;
+    let normalized = parent.join(file_name);
+    let relative = normalized.strip_prefix(&repo).map_err(|_| {
+        AppError::Config(format!(
+            "{} is outside repo {}",
+            normalized.display(),
+            repo.display()
+        ))
+    })?;
+    Ok(path_to_slash(relative))
+}
+
 fn path_to_slash(path: &Path) -> String {
     path.components()
         .map(|component| component.as_os_str().to_string_lossy())
@@ -2982,7 +3092,10 @@ fn render_resolve_problem_prompt(
         feature_spec: spec.body.clone(),
         options: options.to_string(),
         decision: decision.to_string(),
-        output_resolved_problem_path: output_path.display().to_string(),
+        output_resolved_problem_path: repo_relative_slash_path_for_output(
+            &context.repo_root,
+            output_path,
+        )?,
     };
     let template = load_prompt_template(context, PromptTemplateKind::ResolveProblem)
         .map_err(|err| AppError::Config(err.to_string()))?;
@@ -3021,7 +3134,10 @@ fn render_resolve_requirement_prompt(
         feature_spec: spec.body.clone(),
         questions: questions.to_string(),
         answers: answers.to_string(),
-        output_resolved_spec_path: output_path.display().to_string(),
+        output_resolved_spec_path: repo_relative_slash_path_for_output(
+            &context.repo_root,
+            output_path,
+        )?,
     };
     let template = load_prompt_template(context, PromptTemplateKind::ResolveRequirement)
         .map_err(|err| AppError::Config(err.to_string()))?;
@@ -3102,9 +3218,54 @@ fn parse_decompose_output(raw: &str) -> std::result::Result<ParsedDecomposeOutpu
 }
 
 fn parse_task_file_json(raw: &str) -> std::result::Result<TaskFile, String> {
-    let value = serde_json::from_str::<Value>(raw).map_err(|err| format!("invalid JSON: {err}"))?;
+    let mut value =
+        serde_json::from_str::<Value>(raw).map_err(|err| format!("invalid JSON: {err}"))?;
+    normalize_decompose_task_file_value(&mut value);
     serde_json::from_value::<TaskFile>(value)
         .map_err(|err| format!("invalid tasks.json schema: {err}"))
+}
+
+fn normalize_decompose_task_file_value(value: &mut Value) {
+    let Some(tasks) = value.get_mut("tasks").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for task in tasks {
+        let Some(task) = task.as_object_mut() else {
+            continue;
+        };
+        if !task.contains_key("prompt")
+            && let Some(description) = task.get("description").cloned()
+        {
+            task.insert("prompt".to_string(), description);
+        }
+        if !task.contains_key("output") {
+            let id = task.get("id").and_then(Value::as_str).unwrap_or("task");
+            task.insert(
+                "output".to_string(),
+                Value::String(format!("output/{}.md", sanitize_task_output_stem(id))),
+            );
+        }
+    }
+}
+
+fn sanitize_task_output_stem(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_separator = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_separator = false;
+        } else if !last_was_separator {
+            out.push('-');
+            last_was_separator = true;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "task".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn json_code_blocks(raw: &str) -> Vec<&str> {
@@ -3222,7 +3383,7 @@ impl PromptTemplateKind {
         PromptTemplateKind::FinalReviewAggregate,
     ];
 
-    pub fn file_name(self) -> &'static str {
+    pub const fn file_name(self) -> &'static str {
         match self {
             PromptTemplateKind::ProblemFraming => "problem-framing.md",
             PromptTemplateKind::ResolveProblem => "resolve-problem.md",
@@ -3902,394 +4063,29 @@ fn builtin_prompt_template(kind: PromptTemplateKind) -> &'static str {
     }
 }
 
-const PROBLEM_FRAMING_TEMPLATE: &str = r#"# Codex Problem Framing Reviewer
+const PROBLEM_FRAMING_TEMPLATE: &str = include_str!("../prompts/default/problem-framing.md");
 
-Current date: {date}
-Repository root: {repo_root}
-Spec file: {spec_file}
-Problem framing output path: {output_review_path}
+const RESOLVE_PROBLEM_TEMPLATE: &str = include_str!("../prompts/default/resolve-problem.md");
 
-This is a read-only problem framing gate. Do not create tasks and do not modify source code.
+const REQUIREMENT_REVIEW_TEMPLATE: &str = include_str!("../prompts/default/requirement-review.md");
 
-Read the project rules from `{agent_rules_path}` and the overview from `{overview_doc}`. Challenge the requested direction before any requirement decomposition happens.
+const RESOLVE_REQUIREMENT_TEMPLATE: &str =
+    include_str!("../prompts/default/resolve-requirement.md");
 
-Ask:
-- Is the user describing a real problem, or prematurely prescribing a solution?
-- Does the proposed direction bypass existing architecture, data ownership, permissions, audit, API, DB, or compatibility boundaries?
-- Is there a simpler data structure or workflow that removes special cases?
-- Should the user choose between 2-4 materially different approaches before implementation?
+const DECOMPOSE_FEATURE_TEMPLATE: &str = include_str!("../prompts/default/decompose-feature.md");
 
-## Repository Map
-```text
-{repo_map}
-```
+const ANALYZE_TASK_TEMPLATE: &str = include_str!("../prompts/default/analyze-task.md");
 
-## Feature Specification
-{feature_spec}
+const IMPLEMENT_TASK_TEMPLATE: &str = include_str!("../prompts/default/implement-task.md");
 
-Write a Markdown report to `{output_review_path}` when possible. If the sandbox blocks writes, return the exact report as your final message with no code fences. The report must start with YAML frontmatter:
+const REVIEW_TASK_TEMPLATE: &str = include_str!("../prompts/default/review-task.md");
 
-```markdown
----
-verdict: CLEAR
-reviewed_at: <RFC3339>
----
-```
+const REVIEW_FEATURE_TEMPLATE: &str = include_str!("../prompts/default/review-feature.md");
 
-`verdict` must be exactly `CLEAR` or `NEEDS_DECISION`.
+const FINAL_REVIEW_SHARD_TEMPLATE: &str = include_str!("../prompts/default/final-review-shard.md");
 
-Use `CLEAR` only when the requested direction is a sane problem framing and does not need a user decision between approaches.
-
-Use `NEEDS_DECISION` when the user has over-specified a questionable solution, skipped an architectural choice, or must choose between alternatives. The body must contain only concrete options and the decision the user must make.
-"#;
-
-const RESOLVE_PROBLEM_TEMPLATE: &str = r#"# Codex Problem Framing Resolver
-
-Current date: {date}
-Repository root: {repo_root}
-Spec file: {spec_file}
-Resolved problem output path: {output_resolved_problem_path}
-
-This phase resolves a previously blocked problem framing gate. Do not modify source code or task state.
-
-## Original Feature Specification
-{feature_spec}
-
-## Options Presented
-{options}
-
-## User Decision
-{decision}
-
-Write the resolved problem statement to `{output_resolved_problem_path}`. If the sandbox blocks writes, return the complete resolved Markdown problem statement as your final message with no code fences.
-
-The resolved problem must be self-contained, must preserve constraints from the original spec, and must incorporate the selected approach without inventing unrelated scope.
-"#;
-
-const REQUIREMENT_REVIEW_TEMPLATE: &str = r#"# Codex Requirement Reviewer
-
-Current date: {date}
-Repository root: {repo_root}
-Spec file: {spec_file}
-Requirement review output path: {output_review_path}
-
-This is a read-only requirement review. Do not create tasks and do not modify source code.
-
-Read the project rules from `{agent_rules_path}` and the overview from `{overview_doc}`. Decide whether the feature specification is clear enough to decompose into implementation tasks without inventing behavior.
-
-## Repository Map
-```text
-{repo_map}
-```
-
-## Feature Specification
-{feature_spec}
-
-Write a Markdown report to `{output_review_path}` when possible. If the sandbox blocks writes, return the exact report as your final message with no code fences. The report must start with YAML frontmatter:
-
-```markdown
----
-verdict: CLEAR
-reviewed_at: <RFC3339>
----
-```
-
-`verdict` must be exactly `CLEAR` or `NEEDS_CLARIFICATION`.
-
-Use `CLEAR` only when a decomposer can produce tasks without guessing user intent, API behavior, data ownership, compatibility rules, or acceptance criteria.
-
-Use `NEEDS_CLARIFICATION` when any material requirement is missing. The body must contain only concrete questions the user must answer.
-"#;
-
-const RESOLVE_REQUIREMENT_TEMPLATE: &str = r#"# Codex Requirement Resolver
-
-Current date: {date}
-Repository root: {repo_root}
-Spec file: {spec_file}
-Resolved spec output path: {output_resolved_spec_path}
-
-This phase resolves a previously blocked requirement review. Do not modify source code or task state.
-
-## Original Feature Specification
-{feature_spec}
-
-## Clarifying Questions
-{questions}
-
-## User Answers
-{answers}
-
-Write the resolved feature specification to `{output_resolved_spec_path}`. If the sandbox blocks writes, return the complete resolved Markdown spec as your final message with no code fences.
-
-The resolved spec must be self-contained, must preserve constraints from the original spec, and must incorporate the answers without inventing additional scope.
-"#;
-
-const DECOMPOSE_FEATURE_TEMPLATE: &str = r#"# Codex Task Decomposer
-
-Current date: {date}
-Repository root: {repo_root}
-Run id: {run_id}
-Branch: {branch}
-Spec file: {spec_file}
-Output tasks path: {output_tasks_path}
-
-Read the project rules from `{agent_rules_path}` and the overview from `{overview_doc}`. Convert the feature specification into a `tasks.json` v2 object for this local task runner.
-
-## Repository Map
-```text
-{repo_map}
-```
-
-## Feature Specification
-{feature_spec}
-
-## Output Rules
-
-- Output only a valid JSON object. Do not wrap it in markdown.
-- The object must contain `version`, `runId`, `branch`, `specFile`, and `tasks`.
-- Each task must be narrowly scoped, actionable, and include explicit negative constraints from the spec.
-- Each task's `reviewCriteria`, `dependsOn`, and `verificationCommands` fields must be JSON arrays. Do not emit a single string for array fields.
-- Preserve existing project boundaries. Do not invent unrelated APIs, tables, or features.
-"#;
-
-const ANALYZE_TASK_TEMPLATE: &str = r#"# Codex Task Analyzer
-
-Current date: {date}
-Repository root: {repo_root}
-Run store: {runner_dir_rel}
-Task: {task_id} - {title}
-Spec file: {spec_file}
-Analysis output path: {output_analysis_path}
-
-This is a read-only analysis phase. Do not modify code, tests, task state, or other task outputs.
-
-## Task Prompt
-{task_prompt}
-
-## Current Task JSON
-```json
-{task_json}
-```
-
-## Repository Map
-```text
-{repo_map}
-```
-
-## Feature Specification
-{feature_spec}
-
-Write the analysis report to `{output_analysis_path}` when the sandbox allows it. If the sandbox blocks file writes, return the complete Markdown analysis report as your final message with no code fences; the runner will persist it. The report must cover current state, gaps, implementation plan, risks, and acceptance criteria.
-"#;
-
-const IMPLEMENT_TASK_TEMPLATE: &str = r#"# Autonomous Task Runner
-
-Current date: {date}
-Repository root: {repo_root}
-Task file: {task_file}
-Current task: {task_id} - {title}
-
-Hard rules:
-- Execute exactly one task: {task_id}.
-- Do not start any other task.
-- Strictly obey the task prompt, feature spec, project rules, and all negative constraints.
-- Do not update `tasks.json`, `state.json`, or roadmap docs unless this task explicitly requires it.
-- At the end, summarize changed files, focused checks, and remaining gaps.
-
-## Repository Map
-```text
-{repo_map}
-```
-
-## Feature Specification
-{feature_spec}
-
-## Pre-computed Analysis
-{analysis_output}
-
-## Review Comments To Fix
-{last_review_comments}
-
-## Previous Failure
-{last_error}
-
-## Previous Failure Log Tail
-{last_log_tail}
-
-## Task Prompt
-{task_prompt}
-
-## Current Task JSON
-```json
-{task_json}
-```
-"#;
-
-const REVIEW_TASK_TEMPLATE: &str = r#"# Codex Task Reviewer
-
-Current date: {date}
-Repository root: {repo_root}
-Run store: {runner_dir_rel}
-Task: {task_id} - {title}
-Spec file: {spec_file}
-Review output path: {output_review_path}
-
-This is a read-only review. Do not modify code, tests, task state, or other task outputs.
-
-## Task Prompt
-{task_prompt}
-
-## Acceptance Criteria
-{review_criteria}
-
-## Git Diff
-```diff
-{git_diff}
-```
-
-## Feature Specification
-{feature_spec}
-
-## Analysis Report ({output_analysis_path})
-{analysis_output}
-
-## Implementation Summary ({output_impl_path})
-{implementation_summary}
-
-Write a Markdown review report to `{output_review_path}` when the sandbox allows it. If the sandbox blocks file writes, return the exact Markdown review report as your final message with no code fences; the message must start with this YAML frontmatter:
-
-```markdown
----
-task_id: {task_id}
-phase: review
-verdict: APPROVED
-reviewed_at: <RFC3339>
----
-```
-
-`verdict` must be exactly `APPROVED` or `CHANGES_REQUESTED`. Any `[MUST]` issue requires `CHANGES_REQUESTED`.
-"#;
-
-const REVIEW_FEATURE_TEMPLATE: &str = r#"# Codex Feature Reviewer
-
-Current date: {date}
-Repository root: {repo_root}
-Run id: {run_id}
-Branch: {branch}
-Spec file: {spec_file}
-Feature review output path: {output_feature_review_path}
-
-This is a read-only final feature review. Do not edit `tasks.json`, `state.json`, source code, tests, or roadmap docs.
-
-## Feature Specification
-{feature_spec}
-
-## Feature Diff
-```diff
-{git_diff}
-```
-
-## Completed Task Summaries
-{tasks_summaries}
-
-Write a Markdown final review report to `{output_feature_review_path}` when the sandbox allows it. If the sandbox blocks file writes, return the exact Markdown final review report as your final message with no code fences. The report must contain YAML frontmatter with `verdict: APPROVED` or `verdict: CHANGES_REQUESTED`.
-
-MVP rule: final review may report integration issues, but it must not append tasks or modify run state.
-"#;
-
-const FINAL_REVIEW_SHARD_TEMPLATE: &str = r#"# Codex Final Review Shard
-
-Current date: {date}
-Repository root: {repo_root}
-Run id: {run_id}
-Branch: {branch}
-Spec file: {spec_file}
-Review type: {review_type}
-Findings output path: {output_findings_path}
-
-This is a read-only targeted final review shard. Do not modify code, tests, docs, tasks, or state.
-
-Review only the assigned risk type. Use only the context below; do not ask for or assume unrelated files.
-
-## Resolved Specification
-{resolved_spec}
-
-## Change Map
-```json
-{change_map}
-```
-
-## Relevant Diff
-```diff
-{relevant_diff}
-```
-
-## Relevant Logs
-```text
-{relevant_logs}
-```
-
-## Relevant Files
-```text
-{relevant_files}
-```
-
-Write JSON to `{output_findings_path}` when possible. If the sandbox blocks writes, return the exact JSON as your final message with no code fences.
-
-The JSON shape is:
-
-```json
-{
-  "verdict": "APPROVED",
-  "findings": []
-}
-```
-
-`verdict` must be exactly `APPROVED` or `CHANGES_REQUESTED`. Any `MUST_FIX` finding requires `CHANGES_REQUESTED`. Each finding must contain `id`, `severity`, `title`, and `detail`; `severity` must be `MUST_FIX`, `SHOULD_FIX`, or `INFO`.
-"#;
-
-const FINAL_REVIEW_AGGREGATE_TEMPLATE: &str = r#"# Codex Final Review Aggregator
-
-Current date: {date}
-Repository root: {repo_root}
-Run id: {run_id}
-Branch: {branch}
-Spec file: {spec_file}
-Aggregate review output path: {output_review_path}
-
-This is a read-only aggregate final review. Do not modify code, tests, docs, tasks, or state.
-
-You must take the high-level view: compare the resolved spec, change map, all shard findings, public API summary, DB summary, docs summary, and verification summary.
-
-## Resolved Specification
-{resolved_spec}
-
-## Change Map
-```json
-{change_map}
-```
-
-## Shard Findings
-```json
-{shard_findings}
-```
-
-## Public API Summary
-{public_api_summary}
-
-## DB Summary
-{db_summary}
-
-## Docs Summary
-{docs_summary}
-
-## Verification Summary
-{verification_summary}
-
-Write a Markdown aggregate report to `{output_review_path}` when possible. If the sandbox blocks writes, return the exact report as your final message with no code fences. The report must contain YAML frontmatter with `verdict: APPROVED` or `verdict: CHANGES_REQUESTED`.
-
-Missing shard output, invalid shard verdict, execution failure, or any remaining `MUST_FIX` must be `CHANGES_REQUESTED`.
-"#;
+const FINAL_REVIEW_AGGREGATE_TEMPLATE: &str =
+    include_str!("../prompts/default/final-review-aggregate.md");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexExecutorConfig {
@@ -4325,6 +4121,7 @@ pub struct CodexRunRequest {
     pub stderr_log_path: PathBuf,
     pub last_message_path: PathBuf,
     pub required_output_path: Option<PathBuf>,
+    pub fallback_required_output_from_last_message: bool,
     pub sandbox: String,
     pub approval: String,
     pub model: Option<String>,
@@ -4630,7 +4427,7 @@ impl CodexExecutor {
             match fs::read_to_string(output_path) {
                 Ok(value) if !value.trim().is_empty() => {}
                 Ok(_) => {
-                    if request.sandbox == "read-only" {
+                    if should_write_required_output_from_last_message(request) {
                         if let Err(err) =
                             write_required_output_from_last_message(output_path, &last_message)
                         {
@@ -4654,7 +4451,7 @@ impl CodexExecutor {
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    if request.sandbox == "read-only" {
+                    if should_write_required_output_from_last_message(request) {
                         if let Err(err) =
                             write_required_output_from_last_message(output_path, &last_message)
                         {
@@ -4735,6 +4532,10 @@ fn write_required_output_from_last_message(path: &Path, last_message: &str) -> s
         fs::create_dir_all(parent)?;
     }
     fs::write(path, last_message)
+}
+
+fn should_write_required_output_from_last_message(request: &CodexRunRequest) -> bool {
+    request.sandbox == "read-only" || request.fallback_required_output_from_last_message
 }
 
 fn kill_child_tree(child: &mut std::process::Child) {
@@ -6501,6 +6302,7 @@ fn execute_final_review_shard(
             "final-review.round-{round}.{safe_type}.last-message.md"
         )),
         required_output_path: Some(output_path.clone()),
+        fallback_required_output_from_last_message: true,
         sandbox: context.merged.runner.review_sandbox.clone(),
         approval: context.merged.runner.approval.clone(),
         model: context.merged.runner.model.clone(),
@@ -6645,6 +6447,7 @@ fn execute_final_review_aggregate(
             "final-review.round-{round}.aggregate.last-message.md"
         )),
         required_output_path: Some(output_path.to_path_buf()),
+        fallback_required_output_from_last_message: true,
         sandbox: context.merged.runner.review_sandbox.clone(),
         approval: context.merged.runner.approval.clone(),
         model: context.merged.runner.model.clone(),
@@ -7835,12 +7638,34 @@ pub fn load_status(
     };
 
     let run_dir = store.run_dir(&selected_run_id)?;
-    let task_file = store.read_task_file(&selected_run_id)?;
     let run_state = store.read_run_state(&selected_run_id)?;
+    let tasks_path = store.tasks_path(&selected_run_id)?;
+    let task_file = if tasks_path.exists() {
+        read_task_file(&tasks_path)?
+    } else {
+        let metadata = store.read_metadata(&selected_run_id)?;
+        status_task_file_from_metadata(&metadata)
+    };
 
     Ok(StatusResult::View(Box::new(merge_status_view(
         run_dir, task_file, run_state,
     )?)))
+}
+
+fn status_task_file_from_metadata(metadata: &RunMetadata) -> TaskFile {
+    TaskFile {
+        schema_version: 2,
+        run_id: metadata.run_id.clone(),
+        branch: metadata.branch.clone(),
+        spec_file: metadata
+            .resolved_spec_file
+            .clone()
+            .or_else(|| metadata.resolved_problem_file.clone())
+            .unwrap_or_else(|| metadata.spec_file.clone()),
+        verification_commands: Vec::new(),
+        tasks: Vec::new(),
+        extra: Map::new(),
+    }
 }
 
 fn select_run_id(
@@ -8041,7 +7866,7 @@ fn discover_log_files(
             continue;
         }
         if let Some(phase) = phase
-            && !name.contains(&format!(".{phase}."))
+            && !log_name_matches_phase(&name, phase)
         {
             continue;
         }
@@ -8050,6 +7875,10 @@ fn discover_log_files(
     }
     files.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(files)
+}
+
+fn log_name_matches_phase(name: &str, phase: &str) -> bool {
+    name.starts_with(&format!("{phase}.")) || name.contains(&format!(".{phase}."))
 }
 
 fn log_modified_key(path: &Path) -> SystemTime {
@@ -8413,6 +8242,7 @@ fn execute_analyze_phase(
             .join("logs")
             .join(format!("{}.analyze.last-message.md", prepared.task.id)),
         required_output_path: Some(output_path.clone()),
+        fallback_required_output_from_last_message: true,
         sandbox: context.merged.runner.analysis_sandbox.clone(),
         approval: context.merged.runner.approval.clone(),
         model: context.merged.runner.model.clone(),
@@ -8540,6 +8370,7 @@ fn execute_implement_phase(
             .join("logs")
             .join(format!("{}.implement.last-message.md", prepared.task.id)),
         required_output_path: None,
+        fallback_required_output_from_last_message: false,
         sandbox: context.merged.runner.sandbox.clone(),
         approval: context.merged.runner.approval.clone(),
         model: context.merged.runner.model.clone(),
@@ -9242,6 +9073,7 @@ fn execute_review_phase(
             .join("logs")
             .join(format!("{}.review.last-message.md", prepared.task.id)),
         required_output_path: Some(output_path.clone()),
+        fallback_required_output_from_last_message: true,
         sandbox: context.merged.runner.review_sandbox.clone(),
         approval: context.merged.runner.approval.clone(),
         model: context.merged.runner.model.clone(),
@@ -11048,6 +10880,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn output_prompt_path_is_repo_relative_even_when_file_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let visible_dir = repo.join(".codex/task-runs/readme");
+        fs::create_dir_all(&visible_dir).unwrap();
+
+        let output = visible_dir.join("resolved-problem.md");
+        let relative = repo_relative_slash_path_for_output(&repo, &output).unwrap();
+
+        assert_eq!(relative, ".codex/task-runs/readme/resolved-problem.md");
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn output_prompt_path_rejects_paths_outside_repo() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        let err = repo_relative_slash_path_for_output(&repo, &outside.join("report.md"))
+            .expect_err("outside output path should be rejected");
+
+        assert!(err.to_string().contains("outside repo"));
+    }
+
+    #[test]
+    fn log_phase_filter_matches_top_level_and_task_phase_names() {
+        assert!(log_name_matches_phase(
+            "resolve-problem.stderr.log",
+            "resolve-problem"
+        ));
+        assert!(log_name_matches_phase(
+            "resolve-problem.last-message.md",
+            "resolve-problem"
+        ));
+        assert!(log_name_matches_phase(
+            "p1.implement.stderr.log",
+            "implement"
+        ));
+        assert!(!log_name_matches_phase(
+            "requirement-review.stderr.log",
+            "resolve-problem"
+        ));
+    }
+
+    #[test]
     fn parses_toggle_from_bool_and_auto_string() {
         #[derive(Deserialize)]
         struct Wrapper {
@@ -11416,6 +11296,49 @@ printf '# Analysis\n\nRead-only report.\n' > "$last"
 
     #[cfg(unix)]
     #[test]
+    fn codex_executor_can_fallback_to_last_message_for_workspace_write_required_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = fake_codex_script(
+            temp.path(),
+            r#"
+last=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    last="$1"
+  fi
+  shift || break
+done
+printf '# Resolved\n\nWorkspace-write fallback.\n' > "$last"
+"#,
+        );
+        let mut request = sample_codex_request(temp.path());
+        let required_output_path = temp
+            .path()
+            .join(".codex/task-runs/readme/resolved-problem.md");
+        request.required_output_path = Some(required_output_path.clone());
+        request.fallback_required_output_from_last_message = true;
+
+        let output = CodexExecutor::new(CodexExecutorConfig {
+            repo_root: temp.path().to_path_buf(),
+            codex_bin: script,
+            model: None,
+            reasoning_effort: None,
+            search: false,
+            dangerous_bypass_approvals_and_sandbox: false,
+        })
+        .execute(&request)
+        .unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(
+            fs::read_to_string(required_output_path).unwrap(),
+            "# Resolved\n\nWorkspace-write fallback.\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn codex_executor_rejects_empty_last_message_for_read_only_required_output() {
         let temp = tempfile::tempdir().unwrap();
         let script = fake_codex_script(
@@ -11711,6 +11634,74 @@ printf '   \n' > "{}"
         }
         assert_eq!(view.feature_review_status, "failed");
         assert!(format_status_text(&view).contains("review_failed=1"));
+    }
+
+    #[test]
+    fn status_handles_run_before_tasks_are_decomposed() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let home = temp.path().join("home");
+        init_test_repo(&repo);
+        fs::create_dir_all(&home).unwrap();
+
+        let store = RunStore::for_repo(&repo, &home).unwrap();
+        store.ensure_repo_dir().unwrap();
+        let run_dir = store.run_dir("readme").unwrap();
+        fs::create_dir_all(&run_dir).unwrap();
+        store
+            .write_metadata(
+                "readme",
+                &RunMetadata {
+                    schema_version: 1,
+                    run_id: "readme".to_string(),
+                    branch: "feat/readme".to_string(),
+                    spec_file: "docs/roadmap/agent-platform/README.md".to_string(),
+                    problem_framing: ProblemFramingState {
+                        status: ProblemFramingStatus::Resolved,
+                        ..ProblemFramingState::default()
+                    },
+                    resolved_problem_file: Some(
+                        ".codex/task-runs/readme/resolved-problem.md".to_string(),
+                    ),
+                    requirement_review: RequirementReviewState {
+                        status: RequirementReviewStatus::Clear,
+                        ..RequirementReviewState::default()
+                    },
+                    resolved_spec_file: None,
+                    extra: Map::new(),
+                },
+            )
+            .unwrap();
+        store
+            .write_run_state(
+                "readme",
+                &RunState {
+                    problem_framing: ProblemFramingState {
+                        status: ProblemFramingStatus::Resolved,
+                        ..ProblemFramingState::default()
+                    },
+                    requirement_review: RequirementReviewState {
+                        status: RequirementReviewStatus::Clear,
+                        ..RequirementReviewState::default()
+                    },
+                    ..RunState::default()
+                },
+            )
+            .unwrap();
+
+        let status = load_status(&repo, &home, Some("readme")).unwrap();
+        let StatusResult::View(view) = status else {
+            panic!("expected status view");
+        };
+
+        assert_eq!(view.problem_framing_status, "resolved");
+        assert_eq!(view.requirement_review_status, "clear");
+        assert_eq!(
+            view.spec_file,
+            ".codex/task-runs/readme/resolved-problem.md"
+        );
+        assert!(view.tasks.is_empty());
+        assert_eq!(view.counts["pending"], 0);
     }
 
     #[test]
@@ -12162,6 +12153,40 @@ add_include = ["src/**"]
         assert!(events.contains("code block"));
     }
 
+    #[test]
+    fn decompose_output_accepts_description_and_defaults_output() {
+        let parsed = parse_decompose_output(
+            r#"{
+  "version": 2,
+  "runId": "readme",
+  "branch": "feat/readme",
+  "specFile": ".codex/task-runs/readme/resolved-problem.md",
+  "tasks": [
+    {
+      "id": "T001",
+      "priority": 1,
+      "group": "docs",
+      "title": "Write docs",
+      "description": "Update the roadmap docs.",
+      "dependsOn": [],
+      "reviewCriteria": ["Docs are updated."],
+      "verificationCommands": ["git diff --check docs/roadmap/agent-platform/README.md"]
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let task = &parsed.task_file.tasks[0];
+        assert_eq!(task.prompt, "Update the roadmap docs.");
+        assert_eq!(task.output, "output/t001.md");
+        assert_eq!(task.verification_commands.len(), 1);
+        assert_eq!(
+            task.verification_commands[0].command,
+            "git diff --check docs/roadmap/agent-platform/README.md"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn start_fails_invalid_json_without_writing_tasks_and_preserves_output() {
@@ -12286,12 +12311,12 @@ add_include = ["src/**"]
         assert_eq!(result.problem_status, "needs_decision");
         assert_eq!(result.requirement_status, "pending");
         assert!(!result.tasks_path.exists());
-        let options = result.options_path.unwrap();
         let decision = result.decision_path.unwrap();
-        assert!(options.starts_with(repo.join(".codex/task-runs/feature")));
         assert!(decision.starts_with(repo.join(".codex/task-runs/feature")));
-        assert!(fs::read_to_string(&options).unwrap().contains("Option A"));
-        assert!(fs::read_to_string(&decision).unwrap().contains("TODO"));
+        assert!(!repo.join(".codex/task-runs/feature/options.md").exists());
+        let decision_text = fs::read_to_string(&decision).unwrap();
+        assert!(decision_text.contains("Option A"));
+        assert!(decision_text.contains("TODO"));
 
         let store = RunStore::for_repo(&repo, &home).unwrap();
         let state = store.read_run_state("feature").unwrap();
@@ -12342,11 +12367,10 @@ add_include = ["src/**"]
         )
         .unwrap();
         let decision_path = start.decision_path.unwrap();
-        fs::write(
-            &decision_path,
-            "# Decision for feature\n\n## Decision\n\n<!-- codex-task:decision:start -->\nUse Option A and keep auth boundaries.\n<!-- codex-task:decision:end -->\n",
-        )
-        .unwrap();
+        let decision = fs::read_to_string(&decision_path)
+            .unwrap()
+            .replace("TODO", "Use Option A and keep auth boundaries.");
+        fs::write(&decision_path, decision).unwrap();
 
         let resolved_problem_file = ".codex/task-runs/feature/resolved-problem.md";
         let resume_codex = fake_codex_script(
@@ -12380,6 +12404,98 @@ add_include = ["src/**"]
         assert_eq!(
             metadata.resolved_problem_file.as_deref(),
             Some(resolved_problem_file)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_decomposes_after_reviews_clear_when_tasks_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let home = temp.path().join("home");
+        init_test_repo(&repo);
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            repo.join("feature.md"),
+            "# Feature\n\nReplace the auth model with a shortcut.\n",
+        )
+        .unwrap();
+        git(&repo, ["add", "."]);
+        git(&repo, ["commit", "-m", "spec"]);
+
+        let start_codex = fake_codex_script(
+            temp.path(),
+            &problem_needs_decision_script(
+                "- Option A: keep auth boundaries.\n- Option B: shortcut.",
+            ),
+        );
+        let start = start_run_in_repo(
+            &repo,
+            &home,
+            &repo,
+            StartOptions {
+                spec_path: PathBuf::from("feature.md"),
+                run_id: None,
+                branch: None,
+                resume: false,
+                codex_bin: Some(start_codex),
+            },
+        )
+        .unwrap();
+        let decision_path = start.decision_path.unwrap();
+        let decision = fs::read_to_string(&decision_path)
+            .unwrap()
+            .replace("TODO", "Use Option A and keep auth boundaries.");
+        fs::write(&decision_path, decision).unwrap();
+
+        let resolved_problem_file = ".codex/task-runs/feature/resolved-problem.md";
+        let first_resume_codex = fake_codex_script(
+            temp.path(),
+            &resolve_problem_then_requirement_clear_then_decompose_script(
+                "# Resolved Problem\n\nUse Option A and keep auth boundaries.\n",
+                &sample_decompose_json("feature", "feat/feature", resolved_problem_file),
+            ),
+        );
+        resume_run_in_repo(
+            &repo,
+            &home,
+            ResumeOptions {
+                run_id: "feature".to_string(),
+                codex_bin: Some(first_resume_codex),
+            },
+        )
+        .unwrap();
+
+        let store = RunStore::for_repo(&repo, &home).unwrap();
+        fs::remove_file(store.tasks_path("feature").unwrap()).unwrap();
+
+        let decompose_codex = fake_codex_script(
+            temp.path(),
+            &decompose_success_script(&sample_decompose_json(
+                "feature",
+                "feat/feature",
+                resolved_problem_file,
+            )),
+        );
+        let resumed = resume_run_in_repo(
+            &repo,
+            &home,
+            ResumeOptions {
+                run_id: "feature".to_string(),
+                codex_bin: Some(decompose_codex),
+            },
+        )
+        .unwrap();
+
+        assert!(resumed.tasks_path.exists());
+        assert!(resumed.resumed);
+        assert_eq!(resumed.spec_file, resolved_problem_file);
+        let task_file = store.read_task_file("feature").unwrap();
+        assert_eq!(task_file.spec_file, resolved_problem_file);
+        assert!(
+            fs::read_to_string(store.run_dir("feature").unwrap().join("logs/events.log"))
+                .unwrap()
+                .contains("resuming task decomposition")
         );
     }
 
@@ -13419,6 +13535,45 @@ Real decision.
 <!-- codex-task:decision:end -->
 "#
         ));
+        assert_eq!(
+            decision_file_options(
+                r#"# Decision for run
+
+## Options
+
+- Option A
+- Option B
+
+## Decision
+
+<!-- codex-task:decision:start -->
+Choose option A.
+<!-- codex-task:decision:end -->
+"#
+            )
+            .unwrap(),
+            "- Option A\n- Option B"
+        );
+        assert_eq!(
+            decision_file_options(
+                "# Decision for run\r\n\r\n## Options  \r\n\r\n- Option A\r\n\r\n## Decision\r\n\r\n<!-- codex-task:decision:start -->\r\nChoose option A.\r\n<!-- codex-task:decision:end -->\r\n"
+            )
+            .unwrap(),
+            "- Option A"
+        );
+        assert!(
+            decision_file_options(
+                r#"# Decision for run
+
+## Decision
+
+<!-- codex-task:decision:start -->
+Choose option A.
+<!-- codex-task:decision:end -->
+"#
+            )
+            .is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -15300,6 +15455,7 @@ printf 'implementation summary\n' > "$last"
             stderr_log_path: root.join("stderr.log"),
             last_message_path: root.join("last-message.md"),
             required_output_path: None,
+            fallback_required_output_from_last_message: false,
             sandbox: "workspace-write".to_string(),
             approval: "never".to_string(),
             model: None,
@@ -15328,6 +15484,10 @@ set -u
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 printf '%s\n' "$@" > "$script_dir/args.log"
 cat > "$script_dir/stdin.log"
+repo_cwd=$(sed -n '/^-C$/{{n;p;q;}}' "$script_dir/args.log")
+if [ -n "$repo_cwd" ]; then
+  cd "$repo_cwd"
+fi
 {body}
 "#
             ),
@@ -15583,6 +15743,24 @@ CODEX_RESOLVED
   printf 'resolved spec\n' > "$last"
   exit 0
 fi
+cat > "$last" <<'CODEX_DECOMPOSE'
+{decompose_json}
+CODEX_DECOMPOSE
+"#
+        )
+    }
+
+    #[cfg(unix)]
+    fn decompose_success_script(decompose_json: &str) -> String {
+        format!(
+            r#"last=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    last="$1"
+  fi
+  shift || break
+done
 cat > "$last" <<'CODEX_DECOMPOSE'
 {decompose_json}
 CODEX_DECOMPOSE
