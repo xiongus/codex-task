@@ -6102,6 +6102,20 @@ pub struct SchedulerResult {
     pub exit_code: i32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum PendingUserInputKind {
+    Decision,
+    Clarification,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PendingUserInput {
+    pub run_id: String,
+    pub kind: PendingUserInputKind,
+    pub prompt_path: PathBuf,
+    pub response_path: PathBuf,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskExecutionOutcome {
     Continue,
@@ -6147,6 +6161,52 @@ pub fn watch_run(
     let repo_root = find_repo_root(start)?;
     let home = home_dir()?;
     watch_run_in_repo(&repo_root, &home, options)
+}
+
+pub fn pending_user_input(
+    start: &Path,
+    run_id: Option<&str>,
+) -> std::result::Result<Option<PendingUserInput>, AppError> {
+    let repo_root = find_repo_root(start)?;
+    let home = home_dir()?;
+    pending_user_input_in_repo(&repo_root, &home, run_id)
+}
+
+pub fn pending_user_input_in_repo(
+    repo_root: &Path,
+    home: &Path,
+    run_id: Option<&str>,
+) -> std::result::Result<Option<PendingUserInput>, AppError> {
+    let context = load_config(repo_root, home, true)?;
+    let store = RunStore::for_repo(&context.repo_root, &context.home_dir)
+        .map_err(|err| AppError::Runtime(format!("failed to resolve run store: {err}")))?;
+    let run_id = select_run_id(&store, run_id)?;
+    let state = store.read_run_state(&run_id)?;
+    if state.problem_framing.status == ProblemFramingStatus::NeedsDecision
+        && let Some(path) = state.problem_framing.decision_path
+    {
+        let path = PathBuf::from(path);
+        return Ok(Some(PendingUserInput {
+            run_id,
+            kind: PendingUserInputKind::Decision,
+            prompt_path: path.clone(),
+            response_path: path,
+        }));
+    }
+    if state.requirement_review.status == RequirementReviewStatus::NeedsClarification
+        && let (Some(questions), Some(answers)) = (
+            state.requirement_review.questions_path,
+            state.requirement_review.answers_path,
+        )
+    {
+        return Ok(Some(PendingUserInput {
+            run_id,
+            kind: PendingUserInputKind::Clarification,
+            prompt_path: PathBuf::from(questions),
+            response_path: PathBuf::from(answers),
+        }));
+    }
+    Ok(None)
 }
 
 pub fn watch_run_in_repo(

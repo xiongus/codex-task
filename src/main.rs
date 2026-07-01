@@ -1,13 +1,15 @@
 use clap::{Parser, Subcommand};
 use codex_task::{
-    AppError, FinalizeOptions, InspectOptions, LogsOptions, ResetTaskOptions, ResumeOptions,
-    ReviewOptions, RunTaskOptions, SkipPhaseOptions, StartOptions, StatusResult, TaskPhase,
-    VerifyOptions, WatchOptions, finalize_run, find_repo_root, format_doctor_text,
-    format_inspect_text, format_logs_text, format_reset_text, format_skip_phase_text,
-    format_status_text, home_dir, init_project, inspect_run, load_status, read_run_logs,
-    reset_task, resume_run, review_task, run_doctor, run_one_task, skip_phase, start_run,
-    verify_tasks, watch_run,
+    AppError, FinalizeOptions, InspectOptions, LogsOptions, PendingUserInput, PendingUserInputKind,
+    ResetTaskOptions, ResumeOptions, ReviewOptions, RunTaskOptions, SkipPhaseOptions, StartOptions,
+    StartResult, StatusResult, TaskPhase, VerifyOptions, WatchOptions, finalize_run,
+    find_repo_root, format_doctor_text, format_inspect_text, format_logs_text, format_reset_text,
+    format_skip_phase_text, format_status_text, home_dir, init_project, inspect_run, load_status,
+    pending_user_input, read_run_logs, reset_task, resume_run, review_task, run_doctor,
+    run_one_task, skip_phase, start_run, verify_tasks, watch_run,
 };
+use std::fs;
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -333,46 +335,7 @@ fn run(cli: Cli) -> Result<i32, AppError> {
                     codex_bin: None,
                 },
             )?;
-            println!(
-                "{} run {}",
-                if result.resumed { "Resumed" } else { "Started" },
-                result.run_id
-            );
-            println!("Branch: {}", result.branch);
-            println!("Spec: {}", result.spec_file);
-            println!("Run store: {}", result.run_dir.display());
-            println!("Visible run dir: {}", result.visible_run_dir.display());
-            println!("Problem framing: {}", result.problem_status);
-            if let Some(path) = result.decision_path {
-                println!("Decision: {}", path.display());
-            }
-            if let Some(path) = result.resolved_problem_path {
-                println!("Resolved problem: {}", path.display());
-            }
-            println!("Requirement review: {}", result.requirement_status);
-            if let Some(path) = result.questions_path {
-                println!("Questions: {}", path.display());
-            }
-            if let Some(path) = result.answers_path {
-                println!("Answers: {}", path.display());
-            }
-            if let Some(path) = result.resolved_spec_path {
-                println!("Resolved spec: {}", path.display());
-            }
-            println!("Tasks: {}", result.tasks_path.display());
-            println!("State: {}", result.state_path.display());
-            for warning in result.warnings {
-                println!("warning: {warning}");
-            }
-            if result.problem_status == "needs_decision"
-                || result.problem_status == "failed"
-                || result.requirement_status == "needs_clarification"
-                || result.requirement_status == "failed"
-            {
-                Ok(1)
-            } else {
-                Ok(0)
-            }
+            drive_run_interactively(&cwd, result)
         }
         Commands::Resume { run_id } => {
             let result = resume_run(
@@ -382,46 +345,7 @@ fn run(cli: Cli) -> Result<i32, AppError> {
                     codex_bin: None,
                 },
             )?;
-            println!("Resumed run {}", result.run_id);
-            println!("Branch: {}", result.branch);
-            println!("Spec: {}", result.spec_file);
-            println!("Run store: {}", result.run_dir.display());
-            println!("Visible run dir: {}", result.visible_run_dir.display());
-            println!("Problem framing: {}", result.problem_status);
-            if let Some(path) = result.resolved_problem_path {
-                println!("Resolved problem: {}", path.display());
-            }
-            println!("Requirement review: {}", result.requirement_status);
-            if let Some(path) = result.resolved_spec_path {
-                println!("Resolved spec: {}", path.display());
-            }
-            println!("Tasks: {}", result.tasks_path.display());
-            println!("State: {}", result.state_path.display());
-            for warning in result.warnings {
-                println!("warning: {warning}");
-            }
-            if result.problem_status == "needs_decision"
-                || result.problem_status == "failed"
-                || result.requirement_status == "needs_clarification"
-                || result.requirement_status == "failed"
-            {
-                return Ok(1);
-            }
-            println!("Continuing run {}", result.run_id);
-            let scheduler = watch_run(
-                &cwd,
-                WatchOptions {
-                    run_id: Some(result.run_id),
-                    interval_seconds: 0,
-                    max_failures: None,
-                    group: None,
-                    phase: None,
-                    until_phase: None,
-                    codex_bin: None,
-                },
-            )?;
-            println!("{}", scheduler.message);
-            Ok(scheduler.exit_code)
+            drive_run_interactively(&cwd, result)
         }
         Commands::Watch {
             run_id,
@@ -431,20 +355,23 @@ fn run(cli: Cli) -> Result<i32, AppError> {
             phase,
             until_phase,
         } => {
-            let result = watch_run(
-                &cwd,
-                WatchOptions {
-                    run_id,
-                    interval_seconds: interval,
-                    max_failures,
-                    group,
-                    phase,
-                    until_phase,
-                    codex_bin: None,
-                },
-            )?;
+            let mut options = WatchOptions {
+                run_id,
+                interval_seconds: interval,
+                max_failures,
+                group,
+                phase,
+                until_phase,
+                codex_bin: None,
+            };
+            let result = watch_run(&cwd, options.clone())?;
             println!("{}", result.message);
-            Ok(result.exit_code)
+            if result.message == "Run is waiting for phase input" {
+                options.run_id = Some(result.run_id);
+                continue_run_interactively(&cwd, options)
+            } else {
+                Ok(result.exit_code)
+            }
         }
         Commands::Run {
             task_id,
@@ -549,4 +476,221 @@ fn run(cli: Cli) -> Result<i32, AppError> {
             Ok(0)
         }
     }
+}
+
+fn drive_run_interactively(
+    cwd: &std::path::Path,
+    mut result: StartResult,
+) -> Result<i32, AppError> {
+    loop {
+        print_start_result(&result);
+        if start_result_failed(&result) {
+            return Ok(1);
+        }
+        if !start_result_needs_input(&result) {
+            return continue_run_interactively(cwd, default_watch_options(result.run_id));
+        }
+        handle_pending_input(cwd, &result.run_id)?;
+        result = resume_run(
+            cwd,
+            ResumeOptions {
+                run_id: result.run_id,
+                codex_bin: None,
+            },
+        )?;
+    }
+}
+
+fn default_watch_options(run_id: String) -> WatchOptions {
+    WatchOptions {
+        run_id: Some(run_id),
+        interval_seconds: 0,
+        max_failures: None,
+        group: None,
+        phase: None,
+        until_phase: None,
+        codex_bin: None,
+    }
+}
+
+fn continue_run_interactively(
+    cwd: &std::path::Path,
+    options: WatchOptions,
+) -> Result<i32, AppError> {
+    let run_id = options
+        .run_id
+        .clone()
+        .ok_or_else(|| AppError::Config("interactive watch requires a run id".to_string()))?;
+    loop {
+        println!("Continuing run {run_id}");
+        let scheduler = watch_run(cwd, options.clone())?;
+        println!("{}", scheduler.message);
+        if scheduler.message != "Run is waiting for phase input" {
+            return Ok(scheduler.exit_code);
+        }
+        handle_pending_input(cwd, &run_id)?;
+        let mut result = resume_run(
+            cwd,
+            ResumeOptions {
+                run_id: run_id.clone(),
+                codex_bin: None,
+            },
+        )?;
+        loop {
+            print_start_result(&result);
+            if start_result_failed(&result) {
+                return Ok(1);
+            }
+            if !start_result_needs_input(&result) {
+                break;
+            }
+            handle_pending_input(cwd, &result.run_id)?;
+            result = resume_run(
+                cwd,
+                ResumeOptions {
+                    run_id: result.run_id,
+                    codex_bin: None,
+                },
+            )?;
+        }
+    }
+}
+
+fn print_start_result(result: &StartResult) {
+    println!(
+        "{} run {}",
+        if result.resumed { "Resumed" } else { "Started" },
+        result.run_id
+    );
+    println!("Branch: {}", result.branch);
+    println!("Spec: {}", result.spec_file);
+    println!("Run store: {}", result.run_dir.display());
+    println!("Visible run dir: {}", result.visible_run_dir.display());
+    println!("Problem framing: {}", result.problem_status);
+    if let Some(path) = &result.decision_path {
+        println!("Decision: {}", path.display());
+    }
+    if let Some(path) = &result.resolved_problem_path {
+        println!("Resolved problem: {}", path.display());
+    }
+    println!("Requirement review: {}", result.requirement_status);
+    if let Some(path) = &result.questions_path {
+        println!("Questions: {}", path.display());
+    }
+    if let Some(path) = &result.answers_path {
+        println!("Answers: {}", path.display());
+    }
+    if let Some(path) = &result.resolved_spec_path {
+        println!("Resolved spec: {}", path.display());
+    }
+    println!("Tasks: {}", result.tasks_path.display());
+    println!("State: {}", result.state_path.display());
+    for warning in &result.warnings {
+        println!("warning: {warning}");
+    }
+}
+
+fn start_result_needs_input(result: &StartResult) -> bool {
+    result.problem_status == "needs_decision" || result.requirement_status == "needs_clarification"
+}
+
+fn start_result_failed(result: &StartResult) -> bool {
+    result.problem_status == "failed" || result.requirement_status == "failed"
+}
+
+fn handle_pending_input(cwd: &std::path::Path, run_id: &str) -> Result<(), AppError> {
+    let Some(pending) = pending_user_input(cwd, Some(run_id))? else {
+        return Err(AppError::Runtime(format!(
+            "run {run_id} reported waiting for input but no pending input was found"
+        )));
+    };
+    match pending.kind {
+        PendingUserInputKind::Decision => fill_marked_response(
+            &pending,
+            "decision",
+            "Decision required. Enter your decision below. Finish with a single '.' line.",
+        ),
+        PendingUserInputKind::Clarification => fill_marked_response(
+            &pending,
+            "answers",
+            "Clarification required. Enter your answers below. Finish with a single '.' line.",
+        ),
+    }
+}
+
+fn fill_marked_response(
+    pending: &PendingUserInput,
+    marker: &str,
+    prompt: &str,
+) -> Result<(), AppError> {
+    let source = fs::read_to_string(&pending.prompt_path).map_err(|err| {
+        AppError::Io(format!(
+            "failed to read {}: {err}",
+            pending.prompt_path.display()
+        ))
+    })?;
+    println!("\n{}\n", pending.prompt_path.display());
+    println!("{source}");
+    println!("{prompt}");
+    let response = read_multiline_response()?;
+    if response.trim().is_empty() {
+        return Err(AppError::Runtime(
+            "empty response; not resuming".to_string(),
+        ));
+    }
+    let target = fs::read_to_string(&pending.response_path).map_err(|err| {
+        AppError::Io(format!(
+            "failed to read {}: {err}",
+            pending.response_path.display()
+        ))
+    })?;
+    let updated = replace_marker_section(&target, marker, &response)?;
+    fs::write(&pending.response_path, updated).map_err(|err| {
+        AppError::Io(format!(
+            "failed to write {}: {err}",
+            pending.response_path.display()
+        ))
+    })
+}
+
+fn read_multiline_response() -> Result<String, AppError> {
+    let mut out = String::new();
+    loop {
+        print!("> ");
+        io::stdout()
+            .flush()
+            .map_err(|err| AppError::Io(format!("failed to flush stdout: {err}")))?;
+        let mut line = String::new();
+        let read = io::stdin()
+            .read_line(&mut line)
+            .map_err(|err| AppError::Io(format!("failed to read stdin: {err}")))?;
+        if read == 0 {
+            return Err(AppError::Runtime("stdin closed; not resuming".to_string()));
+        }
+        if line.trim_end() == "." {
+            break;
+        }
+        out.push_str(&line);
+    }
+    Ok(out)
+}
+
+fn replace_marker_section(raw: &str, marker: &str, response: &str) -> Result<String, AppError> {
+    let start_marker = format!("<!-- codex-task:{marker}:start -->");
+    let end_marker = format!("<!-- codex-task:{marker}:end -->");
+    let start = raw
+        .find(&start_marker)
+        .ok_or_else(|| AppError::Config(format!("response file missing marker {start_marker}")))?;
+    let content_start = start + start_marker.len();
+    let end_rel = raw[content_start..]
+        .find(&end_marker)
+        .ok_or_else(|| AppError::Config(format!("response file missing marker {end_marker}")))?;
+    let content_end = content_start + end_rel;
+    let mut out = String::new();
+    out.push_str(&raw[..content_start]);
+    out.push('\n');
+    out.push_str(response.trim());
+    out.push('\n');
+    out.push_str(&raw[content_end..]);
+    Ok(out)
 }
