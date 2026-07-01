@@ -1,11 +1,12 @@
 use clap::{Parser, Subcommand};
 use codex_task::{
     AppError, FinalizeOptions, InspectOptions, LogsOptions, ResetTaskOptions, ResumeOptions,
-    ReviewOptions, RunTaskOptions, StartOptions, StatusResult, TaskPhase, VerifyOptions,
-    WatchOptions, finalize_run, find_repo_root, format_doctor_text, format_inspect_text,
-    format_logs_text, format_reset_text, format_status_text, home_dir, init_project, inspect_run,
-    load_status, read_run_logs, reset_task, resume_run, review_task, run_doctor, run_one_task,
-    start_run, verify_tasks, watch_run,
+    ReviewOptions, RunTaskOptions, SkipPhaseOptions, StartOptions, StatusResult, TaskPhase,
+    VerifyOptions, WatchOptions, finalize_run, find_repo_root, format_doctor_text,
+    format_inspect_text, format_logs_text, format_reset_text, format_skip_phase_text,
+    format_status_text, home_dir, init_project, inspect_run, load_status, read_run_logs,
+    reset_task, resume_run, review_task, run_doctor, run_one_task, skip_phase, start_run,
+    verify_tasks, watch_run,
 };
 use std::path::PathBuf;
 
@@ -72,8 +73,8 @@ enum Commands {
     },
     /// Create or resume a run from a feature specification.
     Start {
-        /// Feature specification Markdown file.
-        spec: PathBuf,
+        /// Feature specification Markdown file(s) or directory, in phase order.
+        spec: Vec<PathBuf>,
         /// Override the generated run id.
         #[arg(long)]
         run_id: Option<String>,
@@ -84,7 +85,7 @@ enum Commands {
         #[arg(long)]
         resume: bool,
     },
-    /// Resume a run paused by requirement review after answers.md is filled.
+    /// Resume a run after decision/answers are filled, then continue scheduling.
     Resume {
         /// Run id under the repository run store.
         #[arg(long)]
@@ -101,6 +102,15 @@ enum Commands {
         /// Stop after this many consecutive task failures.
         #[arg(long)]
         max_failures: Option<u64>,
+        /// Run only tasks in this decomposition group.
+        #[arg(long)]
+        group: Option<String>,
+        /// Run only tasks in this roadmap phase.
+        #[arg(long)]
+        phase: Option<String>,
+        /// Run tasks through this roadmap phase, using phase order from tasks.json.
+        #[arg(long)]
+        until_phase: Option<String>,
     },
     /// Run one task through analyze and implement phases.
     Run {
@@ -154,6 +164,20 @@ enum Commands {
         /// Clear review attempts so maxReviewAttempts no longer blocks review.
         #[arg(long)]
         clear_review_attempts: bool,
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Skip a roadmap phase and ignore its unfinished generated tasks.
+    SkipPhase {
+        /// Phase id, e.g. 01-foundation-data-model.
+        phase_id: String,
+        /// Run id under the repository run store.
+        #[arg(long)]
+        run_id: Option<String>,
+        /// Reason recorded in metadata/state.
+        #[arg(long)]
+        reason: Option<String>,
         /// Print machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -293,10 +317,16 @@ fn run(cli: Cli) -> Result<i32, AppError> {
             branch,
             resume,
         } => {
+            let mut specs = spec;
+            let spec_path = specs.first().cloned().ok_or_else(|| {
+                AppError::Config("start requires at least one spec file".to_string())
+            })?;
+            let extra_spec_paths = specs.split_off(1);
             let result = start_run(
                 &cwd,
                 StartOptions {
-                    spec_path: spec,
+                    spec_path,
+                    spec_paths: extra_spec_paths,
                     run_id,
                     branch,
                     resume,
@@ -370,12 +400,36 @@ fn run(cli: Cli) -> Result<i32, AppError> {
             for warning in result.warnings {
                 println!("warning: {warning}");
             }
-            Ok(0)
+            if result.problem_status == "needs_decision"
+                || result.problem_status == "failed"
+                || result.requirement_status == "needs_clarification"
+                || result.requirement_status == "failed"
+            {
+                return Ok(1);
+            }
+            println!("Continuing run {}", result.run_id);
+            let scheduler = watch_run(
+                &cwd,
+                WatchOptions {
+                    run_id: Some(result.run_id),
+                    interval_seconds: 0,
+                    max_failures: None,
+                    group: None,
+                    phase: None,
+                    until_phase: None,
+                    codex_bin: None,
+                },
+            )?;
+            println!("{}", scheduler.message);
+            Ok(scheduler.exit_code)
         }
         Commands::Watch {
             run_id,
             interval,
             max_failures,
+            group,
+            phase,
+            until_phase,
         } => {
             let result = watch_run(
                 &cwd,
@@ -383,6 +437,9 @@ fn run(cli: Cli) -> Result<i32, AppError> {
                     run_id,
                     interval_seconds: interval,
                     max_failures,
+                    group,
+                    phase,
+                    until_phase,
                     codex_bin: None,
                 },
             )?;
@@ -462,6 +519,32 @@ fn run(cli: Cli) -> Result<i32, AppError> {
                 );
             } else {
                 print!("{}", format_reset_text(&result));
+            }
+            Ok(0)
+        }
+        Commands::SkipPhase {
+            phase_id,
+            run_id,
+            reason,
+            json,
+        } => {
+            let result = skip_phase(
+                &cwd,
+                SkipPhaseOptions {
+                    run_id,
+                    phase_id,
+                    reason,
+                },
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).map_err(|err| AppError::Runtime(
+                        format!("failed to encode JSON: {err}")
+                    ))?
+                );
+            } else {
+                print!("{}", format_skip_phase_text(&result));
             }
             Ok(0)
         }

@@ -20,8 +20,11 @@ Read the project rules from `{agent_rules_path}` and the overview from `{overvie
 ## Output Rules
 
 - Output only a valid JSON object. Do not wrap it in markdown.
-- The object must contain `version`, `runId`, `branch`, `specFile`, and `tasks`.
-- Every task object must contain these fields: `id`, `priority`, `group`, `title`, `output`, `prompt`, `dependsOn`, `reviewCriteria`, and `verificationCommands`.
+- The object must contain `version`, `runId`, `branch`, `specFile`, `specFiles`, and `tasks`.
+- `specFiles` must be a JSON array of repository-relative specification files covered by this run.
+- Every task object must contain these fields: `id`, `priority`, `group`, `phase`, `title`, `output`, `prompt`, `specFiles`, `dependsOn`, `reviewCriteria`, and `verificationCommands`.
+- `phase` is the roadmap milestone this task belongs to. For multi-file roadmaps, prefer the source document stem such as `01-foundation-data-model`.
+- Each task `specFiles` array must include only the repository-relative specification files needed by that task. Do not attach all run specs unless the task genuinely spans all of them.
 - Use `prompt` for the executable task instructions. Do not emit `description` instead of `prompt`.
 - Use a stable Markdown path such as `output/<task-id>.md` for each task `output`.
 - Each task must be narrowly scoped, actionable, and include explicit negative constraints from the spec.

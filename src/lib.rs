@@ -547,7 +547,7 @@ impl<'de> Deserialize<'de> for VerificationCommand {
                         "name" => name = Some(map.next_value()?),
                         "command" => command = Some(map.next_value()?),
                         "required" => required = Some(map.next_value()?),
-                        "timeoutSeconds" => timeout_seconds = Some(map.next_value()?),
+                        "timeoutSeconds" => timeout_seconds = map.next_value()?,
                         other => {
                             return Err(de::Error::unknown_field(
                                 other,
@@ -1289,6 +1289,7 @@ fn resolve_prompt_template(context: &ConfigContext, name: &str) -> Result<String
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartOptions {
     pub spec_path: PathBuf,
+    pub spec_paths: Vec<PathBuf>,
     pub run_id: Option<String>,
     pub branch: Option<String>,
     pub resume: bool,
@@ -1331,6 +1332,8 @@ pub struct RunMetadata {
     pub branch: String,
     #[serde(rename = "specFile")]
     pub spec_file: String,
+    #[serde(rename = "specFiles", default)]
+    pub spec_files: Vec<String>,
     #[serde(rename = "problemFraming", default)]
     pub problem_framing: ProblemFramingState,
     #[serde(rename = "resolvedProblemFile", default)]
@@ -1339,6 +1342,31 @@ pub struct RunMetadata {
     pub requirement_review: RequirementReviewState,
     #[serde(rename = "resolvedSpecFile", default)]
     pub resolved_spec_file: Option<String>,
+    #[serde(default)]
+    pub phases: Vec<RunPhaseMetadata>,
+    #[serde(rename = "activePhase", default)]
+    pub active_phase: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunPhaseMetadata {
+    pub id: String,
+    #[serde(rename = "specFile")]
+    pub spec_file: String,
+    #[serde(rename = "specFiles", default)]
+    pub spec_files: Vec<String>,
+    #[serde(rename = "problemFraming", default)]
+    pub problem_framing: ProblemFramingState,
+    #[serde(rename = "resolvedProblemFile", default)]
+    pub resolved_problem_file: Option<String>,
+    #[serde(rename = "requirementReview", default)]
+    pub requirement_review: RequirementReviewState,
+    #[serde(rename = "resolvedSpecFile", default)]
+    pub resolved_spec_file: Option<String>,
+    #[serde(default)]
+    pub decomposed: bool,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -1377,25 +1405,6 @@ pub fn resume_run_in_repo(
     let run_id = options.run_id;
     let _execution_lock = store.try_acquire_execution_lock(&run_id)?;
     let metadata = store.read_metadata(&run_id)?;
-    let tasks_path = store.tasks_path(&run_id)?;
-    if tasks_path.exists() {
-        let task_file = store.read_task_file(&run_id)?;
-        ensure_task_file_matches_run(
-            &task_file,
-            &metadata.run_id,
-            &metadata.branch,
-            &task_file.spec_file,
-        )?;
-        return start_result(
-            &context,
-            &store,
-            &run_id,
-            &metadata.branch,
-            &task_file.spec_file,
-            true,
-            Vec::new(),
-        );
-    }
 
     let mut state = store.read_run_state(&run_id)?;
     if state.problem_framing.status == ProblemFramingStatus::NeedsDecision {
@@ -1413,6 +1422,25 @@ pub fn resume_run_in_repo(
         );
     }
     if state.requirement_review.status != RequirementReviewStatus::NeedsClarification {
+        let tasks_path = store.tasks_path(&run_id)?;
+        if tasks_path.exists() {
+            let task_file = store.read_task_file(&run_id)?;
+            ensure_task_file_matches_run(
+                &task_file,
+                &metadata.run_id,
+                &metadata.branch,
+                &task_file.spec_file,
+            )?;
+            return start_result(
+                &context,
+                &store,
+                &run_id,
+                &metadata.branch,
+                &task_file.spec_file,
+                true,
+                Vec::new(),
+            );
+        }
         return Err(AppError::Runtime(format!(
             "run {run_id} is not waiting for user input; problemFraming={}, requirementReview={}",
             state.problem_framing.status.as_str(),
@@ -1420,7 +1448,14 @@ pub fn resume_run_in_repo(
         )));
     }
 
-    let visible_dir = project_task_run_dir(&context.repo_root, &run_id);
+    let active_phase_id = metadata.active_phase.clone();
+    let visible_dir = phase_visible_dir(&context.repo_root, &run_id, active_phase_id.as_deref());
+    fs::create_dir_all(&visible_dir).map_err(|err| {
+        AppError::Io(format!(
+            "failed to create visible run directory {}: {err}",
+            visible_dir.display()
+        ))
+    })?;
     let questions_path = state
         .requirement_review
         .questions_path
@@ -1500,9 +1535,10 @@ pub fn resume_run_in_repo(
     state.requirement_review.resolved_spec_path = Some(resolved_spec_path.display().to_string());
     state.requirement_review.last_error = None;
     store.write_run_state(&run_id, &state)?;
-    update_metadata_requirement(
+    write_phase_requirement_state(
         &store,
         &run_id,
+        active_phase_id.as_deref(),
         &state.requirement_review,
         Some(resolved_spec_file.clone()),
     )?;
@@ -1515,16 +1551,44 @@ pub fn resume_run_in_repo(
     )?;
 
     let mut warnings = Vec::new();
-    run_decompose(DecomposeRun {
-        context: &context,
-        store: &store,
-        run_id: &run_id,
-        branch: &metadata.branch,
-        spec_file: &resolved_spec_file,
-        spec: &resolved_spec,
-        codex_bin: options.codex_bin,
-        warnings: &mut warnings,
-    })?;
+    if let Some(phase_id) = active_phase_id {
+        let append = store.tasks_path(&run_id)?.exists();
+        let outcome = prepare_run_phase(
+            &context,
+            &store,
+            &run_id,
+            &phase_id,
+            append,
+            options.codex_bin,
+            &mut warnings,
+        )?;
+        if outcome == PhasePrepareOutcome::Waiting {
+            return start_result(
+                &context,
+                &store,
+                &run_id,
+                &metadata.branch,
+                &resolved_spec_file,
+                false,
+                warnings,
+            );
+        }
+    } else {
+        let resolved_spec_files = vec![resolved_spec_file.clone()];
+        run_decompose(DecomposeRun {
+            context: &context,
+            store: &store,
+            run_id: &run_id,
+            branch: &metadata.branch,
+            phase_id: None,
+            spec_file: &resolved_spec_file,
+            spec_files: &resolved_spec_files,
+            spec: &resolved_spec,
+            append: false,
+            codex_bin: options.codex_bin,
+            warnings: &mut warnings,
+        })?;
+    }
 
     start_result(
         &context,
@@ -1545,7 +1609,14 @@ fn resume_problem_decision(
     codex_bin: Option<PathBuf>,
 ) -> std::result::Result<StartResult, AppError> {
     let mut state = store.read_run_state(run_id)?;
-    let visible_dir = project_task_run_dir(&context.repo_root, run_id);
+    let active_phase_id = metadata.active_phase.clone();
+    let visible_dir = phase_visible_dir(&context.repo_root, run_id, active_phase_id.as_deref());
+    fs::create_dir_all(&visible_dir).map_err(|err| {
+        AppError::Io(format!(
+            "failed to create visible run directory {}: {err}",
+            visible_dir.display()
+        ))
+    })?;
     let decision_path = state
         .problem_framing
         .decision_path
@@ -1563,14 +1634,25 @@ fn resume_problem_decision(
     }
     let options = decision_file_options(&decision)?;
 
-    let original_spec = SpecDocument::read(&context.repo_root.join(&metadata.spec_file))?;
+    let (source_spec_file, original_spec) = if let Some(phase_id) = active_phase_id.as_deref() {
+        let phase = find_phase_metadata(metadata, phase_id)?;
+        (
+            phase.spec_file.clone(),
+            read_phase_spec_document(context, phase)?,
+        )
+    } else {
+        (
+            metadata.spec_file.clone(),
+            SpecDocument::read(&context.repo_root.join(&metadata.spec_file))?,
+        )
+    };
     let resolved_problem_path = visible_dir.join("resolved-problem.md");
     let run_dir = store.run_dir(run_id)?;
     let prompt = render_resolve_problem_prompt(ResolveProblemRender {
         context,
         store,
         run_id,
-        spec_file: &metadata.spec_file,
+        spec_file: &source_spec_file,
         spec: &original_spec,
         options: &options,
         decision: &decision,
@@ -1616,9 +1698,10 @@ fn resume_problem_decision(
     state.problem_framing.resolved_problem_path = Some(resolved_problem_path.display().to_string());
     state.problem_framing.last_error = None;
     store.write_run_state(run_id, &state)?;
-    update_metadata_problem_framing(
+    write_phase_problem_framing_state(
         store,
         run_id,
+        active_phase_id.as_deref(),
         &state.problem_framing,
         Some(resolved_problem_file.clone()),
     )?;
@@ -1635,6 +1718,7 @@ fn resume_problem_decision(
         context,
         store,
         run_id,
+        active_phase_id.as_deref(),
         &resolved_problem_file,
         &resolved_problem,
         codex_bin.clone(),
@@ -1651,16 +1735,44 @@ fn resume_problem_decision(
         );
     }
 
-    run_decompose(DecomposeRun {
-        context,
-        store,
-        run_id,
-        branch: &metadata.branch,
-        spec_file: &resolved_problem_file,
-        spec: &resolved_problem,
-        codex_bin,
-        warnings: &mut warnings,
-    })?;
+    if let Some(phase_id) = active_phase_id {
+        let append = store.tasks_path(run_id)?.exists();
+        let outcome = prepare_run_phase(
+            context,
+            store,
+            run_id,
+            &phase_id,
+            append,
+            codex_bin,
+            &mut warnings,
+        )?;
+        if outcome == PhasePrepareOutcome::Waiting {
+            return start_result(
+                context,
+                store,
+                run_id,
+                &metadata.branch,
+                &resolved_problem_file,
+                false,
+                warnings,
+            );
+        }
+    } else {
+        let resolved_problem_files = vec![resolved_problem_file.clone()];
+        run_decompose(DecomposeRun {
+            context,
+            store,
+            run_id,
+            branch: &metadata.branch,
+            phase_id: None,
+            spec_file: &resolved_problem_file,
+            spec_files: &resolved_problem_files,
+            spec: &resolved_problem,
+            append: false,
+            codex_bin,
+            warnings: &mut warnings,
+        })?;
+    }
 
     start_result(
         context,
@@ -1681,7 +1793,8 @@ fn resume_decompose_after_reviews_clear(
     codex_bin: Option<PathBuf>,
 ) -> std::result::Result<StartResult, AppError> {
     let run_dir = store.run_dir(run_id)?;
-    let (spec_file, spec) = active_spec_for_decompose(context, metadata)?;
+    let (spec_file, spec_files, spec) = active_spec_for_decompose(context, metadata)?;
+    let active_phase_id = metadata.active_phase.as_deref();
     let mut warnings = Vec::new();
     append_event_log(
         &run_dir,
@@ -1692,8 +1805,11 @@ fn resume_decompose_after_reviews_clear(
         store,
         run_id,
         branch: &metadata.branch,
+        phase_id: active_phase_id,
         spec_file: &spec_file,
+        spec_files: &spec_files,
         spec: &spec,
+        append: store.tasks_path(run_id)?.exists(),
         codex_bin,
         warnings: &mut warnings,
     })?;
@@ -1722,6 +1838,10 @@ fn active_spec_for_requirement(
         let spec_file = repo_relative_slash_path(&context.repo_root, &path)?;
         return Ok((spec_file, spec));
     }
+    if let Some(phase_id) = &metadata.active_phase {
+        let phase = find_phase_metadata(metadata, phase_id)?;
+        return phase_spec_for_requirement(context, phase);
+    }
     let spec = SpecDocument::read(&context.repo_root.join(&metadata.spec_file))?;
     Ok((metadata.spec_file.clone(), spec))
 }
@@ -1729,17 +1849,168 @@ fn active_spec_for_requirement(
 fn active_spec_for_decompose(
     context: &ConfigContext,
     metadata: &RunMetadata,
-) -> std::result::Result<(String, SpecDocument), AppError> {
+) -> std::result::Result<(String, Vec<String>, SpecDocument), AppError> {
     if let Some(spec_file) = &metadata.resolved_spec_file {
         let spec = SpecDocument::read(&context.repo_root.join(spec_file))?;
-        return Ok((spec_file.clone(), spec));
+        return Ok((spec_file.clone(), vec![spec_file.clone()], spec));
     }
     if let Some(spec_file) = &metadata.resolved_problem_file {
         let spec = SpecDocument::read(&context.repo_root.join(spec_file))?;
+        return Ok((spec_file.clone(), vec![spec_file.clone()], spec));
+    }
+    if let Some(phase_id) = &metadata.active_phase {
+        let phase = find_phase_metadata(metadata, phase_id)?;
+        return phase_spec_for_decompose(context, phase);
+    }
+    let spec_files = normalize_spec_files(&metadata.spec_file, &metadata.spec_files);
+    let spec = read_combined_spec_document(context, &spec_files)?;
+    Ok((metadata.spec_file.clone(), spec_files, spec))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhasePrepareOutcome {
+    Decomposed,
+    Waiting,
+}
+
+fn prepare_run_phase(
+    context: &ConfigContext,
+    store: &RunStore,
+    run_id: &str,
+    phase_id: &str,
+    append: bool,
+    codex_bin: Option<PathBuf>,
+    warnings: &mut Vec<String>,
+) -> std::result::Result<PhasePrepareOutcome, AppError> {
+    let mut metadata = store.read_metadata(run_id)?;
+    let phase = find_phase_metadata(&metadata, phase_id)?.clone();
+    metadata.active_phase = Some(phase.id.clone());
+    metadata.problem_framing = phase.problem_framing.clone();
+    metadata.resolved_problem_file = phase.resolved_problem_file.clone();
+    metadata.requirement_review = phase.requirement_review.clone();
+    metadata.resolved_spec_file = phase.resolved_spec_file.clone();
+    store.write_metadata(run_id, &metadata)?;
+
+    let phase_artifact_id = phase_artifact_id(&metadata, &phase);
+    let mut state = store.read_run_state(run_id)?;
+    state.problem_framing = phase.problem_framing.clone();
+    state.requirement_review = phase.requirement_review.clone();
+    store.write_run_state(run_id, &state)?;
+
+    let phase_spec = read_phase_spec_document(context, &phase)?;
+    let problem_status = if phase.problem_framing.status == ProblemFramingStatus::Clear
+        || phase.problem_framing.status == ProblemFramingStatus::Resolved
+    {
+        phase.problem_framing.status
+    } else {
+        run_problem_framing(
+            context,
+            store,
+            run_id,
+            phase_artifact_id,
+            &phase.spec_file,
+            &phase_spec,
+            codex_bin.clone(),
+        )?
+    };
+    if problem_status != ProblemFramingStatus::Clear
+        && problem_status != ProblemFramingStatus::Resolved
+    {
+        return Ok(PhasePrepareOutcome::Waiting);
+    }
+
+    let metadata = store.read_metadata(run_id)?;
+    let phase = find_phase_metadata(&metadata, phase_id)?.clone();
+    let (review_spec_file, review_spec) = phase_spec_for_requirement(context, &phase)?;
+    let requirement_status = if phase.requirement_review.status == RequirementReviewStatus::Clear
+        || phase.requirement_review.status == RequirementReviewStatus::Resolved
+    {
+        phase.requirement_review.status
+    } else {
+        run_requirement_review(
+            context,
+            store,
+            run_id,
+            phase_artifact_id,
+            &review_spec_file,
+            &review_spec,
+            codex_bin.clone(),
+        )?
+    };
+    if requirement_status != RequirementReviewStatus::Clear
+        && requirement_status != RequirementReviewStatus::Resolved
+    {
+        return Ok(PhasePrepareOutcome::Waiting);
+    }
+
+    let metadata = store.read_metadata(run_id)?;
+    let phase = find_phase_metadata(&metadata, phase_id)?.clone();
+    let (decompose_spec_file, decompose_spec_files, decompose_spec) =
+        phase_spec_for_decompose(context, &phase)?;
+    run_decompose(DecomposeRun {
+        context,
+        store,
+        run_id,
+        branch: &metadata.branch,
+        phase_id: phase_artifact_id,
+        spec_file: &decompose_spec_file,
+        spec_files: &decompose_spec_files,
+        spec: &decompose_spec,
+        append,
+        codex_bin,
+        warnings,
+    })?;
+    Ok(PhasePrepareOutcome::Decomposed)
+}
+
+fn phase_artifact_id<'a>(
+    metadata: &'a RunMetadata,
+    phase: &'a RunPhaseMetadata,
+) -> Option<&'a str> {
+    (!metadata.phases.is_empty()).then_some(phase.id.as_str())
+}
+
+fn read_phase_spec_document(
+    context: &ConfigContext,
+    phase: &RunPhaseMetadata,
+) -> std::result::Result<SpecDocument, AppError> {
+    read_combined_spec_document(
+        context,
+        &normalize_spec_files(&phase.spec_file, &phase.spec_files),
+    )
+}
+
+fn phase_spec_for_requirement(
+    context: &ConfigContext,
+    phase: &RunPhaseMetadata,
+) -> std::result::Result<(String, SpecDocument), AppError> {
+    if phase.problem_framing.status == ProblemFramingStatus::Resolved
+        && let Some(spec_file) = &phase.resolved_problem_file
+    {
+        let spec = SpecDocument::read(&context.repo_root.join(spec_file))?;
         return Ok((spec_file.clone(), spec));
     }
-    let spec = SpecDocument::read(&context.repo_root.join(&metadata.spec_file))?;
-    Ok((metadata.spec_file.clone(), spec))
+    Ok((
+        phase.spec_file.clone(),
+        read_phase_spec_document(context, phase)?,
+    ))
+}
+
+fn phase_spec_for_decompose(
+    context: &ConfigContext,
+    phase: &RunPhaseMetadata,
+) -> std::result::Result<(String, Vec<String>, SpecDocument), AppError> {
+    if let Some(spec_file) = &phase.resolved_spec_file {
+        let spec = SpecDocument::read(&context.repo_root.join(spec_file))?;
+        return Ok((spec_file.clone(), vec![spec_file.clone()], spec));
+    }
+    if let Some(spec_file) = &phase.resolved_problem_file {
+        let spec = SpecDocument::read(&context.repo_root.join(spec_file))?;
+        return Ok((spec_file.clone(), vec![spec_file.clone()], spec));
+    }
+    let spec_files = normalize_spec_files(&phase.spec_file, &phase.spec_files);
+    let spec = read_combined_spec_document(context, &spec_files)?;
+    Ok((phase.spec_file.clone(), spec_files, spec))
 }
 
 pub fn start_run_in_repo(
@@ -1758,9 +2029,21 @@ pub fn start_run_in_repo(
         ))
     })?;
 
-    let spec_path = resolve_spec_path(cwd, &context.repo_root, &options.spec_path)?;
-    let spec_file = repo_relative_slash_path(&context.repo_root, &spec_path)?;
-    let mut spec = SpecDocument::read(&spec_path)?;
+    let spec_inputs = resolve_spec_files(
+        cwd,
+        &context.repo_root,
+        &options.spec_path,
+        &options.spec_paths,
+    )?;
+    let (spec_file, spec_path, mut spec) = spec_inputs
+        .first()
+        .cloned()
+        .expect("resolve_spec_files always returns at least one spec");
+    let spec_files = spec_inputs
+        .iter()
+        .map(|(path, _, _)| path.clone())
+        .collect::<Vec<_>>();
+    let phases = run_phases_from_spec_inputs(&spec_inputs);
     let discovered = discover_run_metadata_for_spec(&store, &spec_file)?;
 
     let metadata_run_id = spec
@@ -1852,6 +2135,15 @@ pub fn start_run_in_repo(
         run_id: run_id.clone(),
         branch: branch.clone(),
         spec_file: spec_file.clone(),
+        spec_files: spec_files.clone(),
+        phases: existing_metadata
+            .as_ref()
+            .filter(|metadata| !metadata.phases.is_empty())
+            .map(|metadata| metadata.phases.clone())
+            .unwrap_or_else(|| phases.clone()),
+        active_phase: existing_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.active_phase.clone()),
         problem_framing: existing_metadata
             .as_ref()
             .map(|metadata| metadata.problem_framing.clone())
@@ -1902,44 +2194,37 @@ pub fn start_run_in_repo(
         );
     }
 
-    let problem_status = run_problem_framing(
+    let first_phase_id = metadata
+        .phases
+        .first()
+        .map(|phase| phase.id.clone())
+        .ok_or_else(|| AppError::Config("run has no phases".to_string()))?;
+    let outcome = prepare_run_phase(
         &context,
         &store,
         &run_id,
-        &spec_file,
-        &spec,
-        options.codex_bin.clone(),
+        &first_phase_id,
+        false,
+        options.codex_bin,
+        &mut warnings,
     )?;
-    if problem_status != ProblemFramingStatus::Clear {
+    if outcome == PhasePrepareOutcome::Waiting {
+        let metadata = store.read_metadata(&run_id)?;
         return start_result(
-            &context, &store, &run_id, &branch, &spec_file, false, warnings,
+            &context,
+            &store,
+            &run_id,
+            &branch,
+            metadata
+                .active_phase
+                .as_deref()
+                .and_then(|phase_id| find_phase_metadata(&metadata, phase_id).ok())
+                .map(|phase| phase.spec_file.as_str())
+                .unwrap_or(&spec_file),
+            false,
+            warnings,
         );
     }
-
-    let review_status = run_requirement_review(
-        &context,
-        &store,
-        &run_id,
-        &spec_file,
-        &spec,
-        options.codex_bin.clone(),
-    )?;
-    if review_status != RequirementReviewStatus::Clear {
-        return start_result(
-            &context, &store, &run_id, &branch, &spec_file, false, warnings,
-        );
-    }
-
-    run_decompose(DecomposeRun {
-        context: &context,
-        store: &store,
-        run_id: &run_id,
-        branch: &branch,
-        spec_file: &spec_file,
-        spec: &spec,
-        codex_bin: options.codex_bin,
-        warnings: &mut warnings,
-    })?;
 
     start_result(
         &context, &store, &run_id, &branch, &spec_file, false, warnings,
@@ -1983,12 +2268,13 @@ fn run_problem_framing(
     context: &ConfigContext,
     store: &RunStore,
     run_id: &str,
+    phase_id: Option<&str>,
     spec_file: &str,
     spec: &SpecDocument,
     codex_bin: Option<PathBuf>,
 ) -> std::result::Result<ProblemFramingStatus, AppError> {
     let run_dir = store.run_dir(run_id)?;
-    let visible_dir = project_task_run_dir(&context.repo_root, run_id);
+    let visible_dir = phase_visible_dir(&context.repo_root, run_id, phase_id);
     fs::create_dir_all(&visible_dir).map_err(|err| {
         AppError::Io(format!(
             "failed to create visible run directory {}: {err}",
@@ -1996,7 +2282,9 @@ fn run_problem_framing(
         ))
     })?;
 
-    let output_path = run_dir.join("output/problem-framing.md");
+    let output_path = run_dir
+        .join("output")
+        .join(phase_file_stem(phase_id, "problem-framing.md"));
     let decision_path = visible_dir.join("decision.md");
     let now = current_timestamp()?;
     let mut problem = ProblemFramingState {
@@ -2005,17 +2293,24 @@ fn run_problem_framing(
         output: Some(output_path.display().to_string()),
         ..ProblemFramingState::default()
     };
-    write_problem_framing_state(store, run_id, &problem)?;
-    update_metadata_problem_framing(store, run_id, &problem, None)?;
+    write_phase_problem_framing_state(store, run_id, phase_id, &problem, None)?;
 
     let prompt =
         render_problem_framing_prompt(context, store, run_id, spec_file, spec, &output_path)?;
     let request = CodexRunRequest {
         prompt,
-        prompt_path: run_dir.join("prompts/problem-framing.md"),
-        stdout_log_path: run_dir.join("logs/problem-framing.stdout.log"),
-        stderr_log_path: run_dir.join("logs/problem-framing.stderr.log"),
-        last_message_path: run_dir.join("logs/problem-framing.last-message.md"),
+        prompt_path: run_dir
+            .join("prompts")
+            .join(phase_file_stem(phase_id, "problem-framing.md")),
+        stdout_log_path: run_dir
+            .join("logs")
+            .join(phase_file_stem(phase_id, "problem-framing.stdout.log")),
+        stderr_log_path: run_dir
+            .join("logs")
+            .join(phase_file_stem(phase_id, "problem-framing.stderr.log")),
+        last_message_path: run_dir
+            .join("logs")
+            .join(phase_file_stem(phase_id, "problem-framing.last-message.md")),
         required_output_path: Some(output_path.clone()),
         fallback_required_output_from_last_message: true,
         sandbox: context.merged.runner.review_sandbox.clone(),
@@ -2037,8 +2332,7 @@ fn run_problem_framing(
             problem.status = ProblemFramingStatus::Failed;
             problem.last_error = Some(message.clone());
             problem.output = Some(err.stderr_log_path.display().to_string());
-            write_problem_framing_state(store, run_id, &problem)?;
-            update_metadata_problem_framing(store, run_id, &problem, None)?;
+            write_phase_problem_framing_state(store, run_id, phase_id, &problem, None)?;
             return Err(AppError::Runtime(format!(
                 "{message}; logs: stdout={}, stderr={}, last={}",
                 stdout_log.display(),
@@ -2053,8 +2347,7 @@ fn run_problem_framing(
         Err(err) => {
             problem.status = ProblemFramingStatus::Failed;
             problem.last_error = Some(err.clone());
-            write_problem_framing_state(store, run_id, &problem)?;
-            update_metadata_problem_framing(store, run_id, &problem, None)?;
+            write_phase_problem_framing_state(store, run_id, phase_id, &problem, None)?;
             return Err(AppError::Runtime(format!(
                 "invalid problem framing output: {err}; raw output preserved at {}",
                 output_path.display()
@@ -2091,8 +2384,7 @@ fn run_problem_framing(
         _ => {}
     }
 
-    write_problem_framing_state(store, run_id, &problem)?;
-    update_metadata_problem_framing(store, run_id, &problem, None)?;
+    write_phase_problem_framing_state(store, run_id, phase_id, &problem, None)?;
     Ok(decision.status)
 }
 
@@ -2100,12 +2392,13 @@ fn run_requirement_review(
     context: &ConfigContext,
     store: &RunStore,
     run_id: &str,
+    phase_id: Option<&str>,
     spec_file: &str,
     spec: &SpecDocument,
     codex_bin: Option<PathBuf>,
 ) -> std::result::Result<RequirementReviewStatus, AppError> {
     let run_dir = store.run_dir(run_id)?;
-    let visible_dir = project_task_run_dir(&context.repo_root, run_id);
+    let visible_dir = phase_visible_dir(&context.repo_root, run_id, phase_id);
     fs::create_dir_all(&visible_dir).map_err(|err| {
         AppError::Io(format!(
             "failed to create visible run directory {}: {err}",
@@ -2113,7 +2406,9 @@ fn run_requirement_review(
         ))
     })?;
 
-    let output_path = run_dir.join("output/requirement-review.md");
+    let output_path = run_dir
+        .join("output")
+        .join(phase_file_stem(phase_id, "requirement-review.md"));
     let questions_path = visible_dir.join("questions.md");
     let answers_path = visible_dir.join("answers.md");
     let now = current_timestamp()?;
@@ -2124,17 +2419,25 @@ fn run_requirement_review(
         output: Some(output_path.display().to_string()),
         ..RequirementReviewState::default()
     };
-    write_requirement_state(store, run_id, &requirement)?;
-    update_metadata_requirement(store, run_id, &requirement, None)?;
+    write_phase_requirement_state(store, run_id, phase_id, &requirement, None)?;
 
     let prompt =
         render_requirement_review_prompt(context, store, run_id, spec_file, spec, &output_path)?;
     let request = CodexRunRequest {
         prompt,
-        prompt_path: run_dir.join("prompts/requirement-review.md"),
-        stdout_log_path: run_dir.join("logs/requirement-review.stdout.log"),
-        stderr_log_path: run_dir.join("logs/requirement-review.stderr.log"),
-        last_message_path: run_dir.join("logs/requirement-review.last-message.md"),
+        prompt_path: run_dir
+            .join("prompts")
+            .join(phase_file_stem(phase_id, "requirement-review.md")),
+        stdout_log_path: run_dir
+            .join("logs")
+            .join(phase_file_stem(phase_id, "requirement-review.stdout.log")),
+        stderr_log_path: run_dir
+            .join("logs")
+            .join(phase_file_stem(phase_id, "requirement-review.stderr.log")),
+        last_message_path: run_dir.join("logs").join(phase_file_stem(
+            phase_id,
+            "requirement-review.last-message.md",
+        )),
         required_output_path: Some(output_path.clone()),
         fallback_required_output_from_last_message: true,
         sandbox: context.merged.runner.review_sandbox.clone(),
@@ -2156,8 +2459,7 @@ fn run_requirement_review(
             requirement.status = RequirementReviewStatus::Failed;
             requirement.last_error = Some(message.clone());
             requirement.output = Some(err.stderr_log_path.display().to_string());
-            write_requirement_state(store, run_id, &requirement)?;
-            update_metadata_requirement(store, run_id, &requirement, None)?;
+            write_phase_requirement_state(store, run_id, phase_id, &requirement, None)?;
             return Err(AppError::Runtime(format!(
                 "{message}; logs: stdout={}, stderr={}, last={}",
                 stdout_log.display(),
@@ -2172,8 +2474,7 @@ fn run_requirement_review(
         Err(err) => {
             requirement.status = RequirementReviewStatus::Failed;
             requirement.last_error = Some(err.clone());
-            write_requirement_state(store, run_id, &requirement)?;
-            update_metadata_requirement(store, run_id, &requirement, None)?;
+            write_phase_requirement_state(store, run_id, phase_id, &requirement, None)?;
             return Err(AppError::Runtime(format!(
                 "invalid requirement review output: {err}; raw output preserved at {}",
                 output_path.display()
@@ -2219,8 +2520,7 @@ fn run_requirement_review(
         _ => {}
     }
 
-    write_requirement_state(store, run_id, &requirement)?;
-    update_metadata_requirement(store, run_id, &requirement, None)?;
+    write_phase_requirement_state(store, run_id, phase_id, &requirement, None)?;
     Ok(decision.status)
 }
 
@@ -2229,8 +2529,11 @@ struct DecomposeRun<'a> {
     store: &'a RunStore,
     run_id: &'a str,
     branch: &'a str,
+    phase_id: Option<&'a str>,
     spec_file: &'a str,
+    spec_files: &'a [String],
     spec: &'a SpecDocument,
+    append: bool,
     codex_bin: Option<PathBuf>,
     warnings: &'a mut Vec<String>,
 }
@@ -2241,8 +2544,11 @@ fn run_decompose(input: DecomposeRun<'_>) -> std::result::Result<(), AppError> {
         store,
         run_id,
         branch,
+        phase_id,
         spec_file,
+        spec_files,
         spec,
+        append,
         codex_bin,
         warnings,
     } = input;
@@ -2250,10 +2556,18 @@ fn run_decompose(input: DecomposeRun<'_>) -> std::result::Result<(), AppError> {
     let prompt = render_decompose_prompt(context, store, run_id, branch, spec_file, spec)?;
     let request = CodexRunRequest {
         prompt,
-        prompt_path: run_dir.join("prompts/decompose-feature.md"),
-        stdout_log_path: run_dir.join("logs/decompose.stdout.log"),
-        stderr_log_path: run_dir.join("logs/decompose.stderr.log"),
-        last_message_path: run_dir.join("last-message.md"),
+        prompt_path: run_dir
+            .join("prompts")
+            .join(phase_file_stem(phase_id, "decompose-feature.md")),
+        stdout_log_path: run_dir
+            .join("logs")
+            .join(phase_file_stem(phase_id, "decompose.stdout.log")),
+        stderr_log_path: run_dir
+            .join("logs")
+            .join(phase_file_stem(phase_id, "decompose.stderr.log")),
+        last_message_path: run_dir
+            .join("logs")
+            .join(phase_file_stem(phase_id, "decompose.last-message.md")),
         required_output_path: None,
         fallback_required_output_from_last_message: false,
         sandbox: context.merged.runner.sandbox.clone(),
@@ -2288,18 +2602,36 @@ fn run_decompose(input: DecomposeRun<'_>) -> std::result::Result<(), AppError> {
         warnings.push(warning);
     }
 
-    let mut task_file = parsed.task_file;
-    task_file.schema_version = 2;
-    task_file.run_id = run_id.to_string();
-    task_file.branch = branch.to_string();
-    task_file.spec_file = spec_file.to_string();
+    let mut new_task_file = parsed.task_file;
+    new_task_file.schema_version = 2;
+    new_task_file.run_id = run_id.to_string();
+    new_task_file.branch = branch.to_string();
+    new_task_file.spec_file = spec_file.to_string();
+    new_task_file.spec_files = normalize_spec_files(spec_file, spec_files);
+    normalize_task_scopes(&mut new_task_file);
+    validate_task_file(&new_task_file)?;
+
+    let tasks_path = store.tasks_path(run_id)?;
+    let task_file = if append && tasks_path.exists() {
+        let mut existing = store.read_task_file(run_id)?;
+        let mut merged_spec_files = existing.spec_files.clone();
+        merged_spec_files.extend(new_task_file.spec_files.clone());
+        existing.spec_files = normalize_spec_files(&existing.spec_file, &merged_spec_files);
+        existing
+            .verification_commands
+            .extend(new_task_file.verification_commands);
+        existing.tasks.extend(new_task_file.tasks);
+        normalize_task_scopes(&mut existing);
+        existing
+    } else {
+        new_task_file
+    };
     validate_task_file(&task_file)?;
     store.write_task_file(run_id, &task_file)?;
+    mark_phase_decomposed(store, run_id, phase_id)?;
     let previous_state = store.read_run_state(run_id).unwrap_or_default();
-    let mut next_state = initial_run_state(&task_file);
-    next_state.problem_framing = previous_state.problem_framing;
-    next_state.requirement_review = previous_state.requirement_review;
-    next_state.final_review = previous_state.final_review;
+    let mut next_state = previous_state;
+    ensure_state_matches_tasks(&task_file, &mut next_state)?;
     store.write_run_state(run_id, &next_state)?;
     Ok(())
 }
@@ -2358,6 +2690,30 @@ fn update_metadata_problem_framing(
     store.write_metadata(run_id, &metadata)
 }
 
+fn write_phase_problem_framing_state(
+    store: &RunStore,
+    run_id: &str,
+    phase_id: Option<&str>,
+    problem: &ProblemFramingState,
+    resolved_problem_file: Option<String>,
+) -> std::result::Result<(), AppError> {
+    write_problem_framing_state(store, run_id, problem)?;
+    let Some(phase_id) = phase_id else {
+        return update_metadata_problem_framing(store, run_id, problem, resolved_problem_file);
+    };
+    let mut metadata = store.read_metadata(run_id)?;
+    metadata.problem_framing = problem.clone();
+    if resolved_problem_file.is_some() {
+        metadata.resolved_problem_file = resolved_problem_file.clone();
+    }
+    let phase = find_phase_metadata_mut(&mut metadata, phase_id)?;
+    phase.problem_framing = problem.clone();
+    if resolved_problem_file.is_some() {
+        phase.resolved_problem_file = resolved_problem_file;
+    }
+    store.write_metadata(run_id, &metadata)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RequirementReviewDecision {
     status: RequirementReviewStatus,
@@ -2412,8 +2768,88 @@ fn update_metadata_requirement(
     store.write_metadata(run_id, &metadata)
 }
 
+fn write_phase_requirement_state(
+    store: &RunStore,
+    run_id: &str,
+    phase_id: Option<&str>,
+    requirement: &RequirementReviewState,
+    resolved_spec_file: Option<String>,
+) -> std::result::Result<(), AppError> {
+    write_requirement_state(store, run_id, requirement)?;
+    let Some(phase_id) = phase_id else {
+        return update_metadata_requirement(store, run_id, requirement, resolved_spec_file);
+    };
+    let mut metadata = store.read_metadata(run_id)?;
+    metadata.requirement_review = requirement.clone();
+    if resolved_spec_file.is_some() {
+        metadata.resolved_spec_file = resolved_spec_file.clone();
+    }
+    let phase = find_phase_metadata_mut(&mut metadata, phase_id)?;
+    phase.requirement_review = requirement.clone();
+    if resolved_spec_file.is_some() {
+        phase.resolved_spec_file = resolved_spec_file;
+    }
+    store.write_metadata(run_id, &metadata)
+}
+
+fn find_phase_metadata_mut<'a>(
+    metadata: &'a mut RunMetadata,
+    phase_id: &str,
+) -> std::result::Result<&'a mut RunPhaseMetadata, AppError> {
+    metadata
+        .phases
+        .iter_mut()
+        .find(|phase| phase.id == phase_id)
+        .ok_or_else(|| AppError::Config(format!("unknown phase: {phase_id}")))
+}
+
+fn find_phase_metadata<'a>(
+    metadata: &'a RunMetadata,
+    phase_id: &str,
+) -> std::result::Result<&'a RunPhaseMetadata, AppError> {
+    metadata
+        .phases
+        .iter()
+        .find(|phase| phase.id == phase_id)
+        .ok_or_else(|| AppError::Config(format!("unknown phase: {phase_id}")))
+}
+
+fn mark_phase_decomposed(
+    store: &RunStore,
+    run_id: &str,
+    phase_id: Option<&str>,
+) -> std::result::Result<(), AppError> {
+    let mut metadata = store.read_metadata(run_id)?;
+    let phase_id = phase_id
+        .map(str::to_string)
+        .or_else(|| metadata.active_phase.clone());
+    let Some(phase_id) = phase_id else {
+        return Ok(());
+    };
+    let phase = find_phase_metadata_mut(&mut metadata, &phase_id)?;
+    phase.decomposed = true;
+    metadata.active_phase = None;
+    store.write_metadata(run_id, &metadata)
+}
+
 fn project_task_run_dir(repo_root: &Path, run_id: &str) -> PathBuf {
     repo_root.join(".codex/task-runs").join(run_id)
+}
+
+fn phase_visible_dir(repo_root: &Path, run_id: &str, phase_id: Option<&str>) -> PathBuf {
+    match phase_id {
+        Some(phase_id) => project_task_run_dir(repo_root, run_id)
+            .join("phases")
+            .join(phase_id),
+        None => project_task_run_dir(repo_root, run_id),
+    }
+}
+
+fn phase_file_stem(phase_id: Option<&str>, name: &str) -> String {
+    match phase_id {
+        Some(phase_id) => format!("{phase_id}.{name}"),
+        None => name.to_string(),
+    }
 }
 
 fn write_decision_file(
@@ -2546,6 +2982,27 @@ impl SpecDocument {
     fn write(&self, path: &Path) -> std::result::Result<(), AppError> {
         fs::write(path, self.to_text())
             .map_err(|err| AppError::Io(format!("failed to write {}: {err}", path.display())))
+    }
+
+    fn from_spec_files(files: &[(String, SpecDocument)]) -> Self {
+        if files.len() == 1 {
+            return files[0].1.clone();
+        }
+        let mut body = String::new();
+        for (index, (path, document)) in files.iter().enumerate() {
+            if index > 0 {
+                body.push_str("\n\n");
+            }
+            body.push_str("# Spec: ");
+            body.push_str(path);
+            body.push_str("\n\n");
+            body.push_str(document.body.trim());
+            body.push('\n');
+        }
+        Self {
+            frontmatter: None,
+            body,
+        }
     }
 
     fn set_run_metadata(&mut self, run_id: &str, branch: &str) -> bool {
@@ -2775,6 +3232,272 @@ fn resolve_spec_path(
     Ok(canonical)
 }
 
+fn resolve_spec_files(
+    cwd: &Path,
+    repo_root: &Path,
+    primary: &Path,
+    additional: &[PathBuf],
+) -> std::result::Result<Vec<(String, PathBuf, SpecDocument)>, AppError> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for input_path in std::iter::once(primary).chain(additional.iter().map(PathBuf::as_path)) {
+        for path in resolve_spec_input_paths(cwd, repo_root, input_path)? {
+            let relative = repo_relative_slash_path(repo_root, &path)?;
+            if !seen.insert(relative.clone()) {
+                return Err(AppError::Config(format!(
+                    "duplicate spec file in start input: {relative}"
+                )));
+            }
+            let spec = SpecDocument::read(&path)?;
+            out.push((relative, path, spec));
+        }
+    }
+    Ok(out)
+}
+
+fn resolve_spec_input_paths(
+    cwd: &Path,
+    repo_root: &Path,
+    input_path: &Path,
+) -> std::result::Result<Vec<PathBuf>, AppError> {
+    let raw_path = if input_path.is_absolute() {
+        input_path.to_path_buf()
+    } else {
+        cwd.join(input_path)
+    };
+    let canonical = raw_path.canonicalize().map_err(|err| {
+        AppError::Io(format!(
+            "failed to canonicalize {}: {err}",
+            raw_path.display()
+        ))
+    })?;
+    if canonical.is_file() {
+        return Ok(vec![resolve_spec_path(cwd, repo_root, input_path)?]);
+    }
+    if !canonical.is_dir() {
+        return Err(AppError::Config(format!(
+            "spec path is not a file or directory: {}",
+            canonical.display()
+        )));
+    }
+    let repo = repo_root.canonicalize().map_err(|err| {
+        AppError::Io(format!(
+            "failed to canonicalize repo root {}: {err}",
+            repo_root.display()
+        ))
+    })?;
+    canonical.strip_prefix(&repo).map_err(|_| {
+        AppError::Config(format!(
+            "spec directory {} is outside repo {}",
+            canonical.display(),
+            repo.display()
+        ))
+    })?;
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(&canonical)
+        .map_err(|err| AppError::Io(format!("failed to read {}: {err}", canonical.display())))?
+    {
+        let entry = entry.map_err(|err| {
+            AppError::Io(format!(
+                "failed to read {} entry: {err}",
+                canonical.display()
+            ))
+        })?;
+        let path = entry.path();
+        if path.is_file()
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+        {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    if paths.is_empty() {
+        return Err(AppError::Config(format!(
+            "spec directory has no Markdown files: {}",
+            canonical.display()
+        )));
+    }
+    Ok(paths)
+}
+
+fn run_phases_from_spec_inputs(
+    inputs: &[(String, PathBuf, SpecDocument)],
+) -> Vec<RunPhaseMetadata> {
+    inputs
+        .iter()
+        .map(|(spec_file, _, _)| {
+            let id = phase_id_from_spec_file(spec_file);
+            RunPhaseMetadata {
+                id,
+                spec_file: spec_file.clone(),
+                spec_files: vec![spec_file.clone()],
+                problem_framing: ProblemFramingState::default(),
+                resolved_problem_file: None,
+                requirement_review: RequirementReviewState::default(),
+                resolved_spec_file: None,
+                decomposed: false,
+                extra: Map::new(),
+            }
+        })
+        .collect()
+}
+
+fn phase_id_from_spec_file(spec_file: &str) -> String {
+    Path::new(spec_file)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(sanitize_task_output_stem)
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| sanitize_task_output_stem(spec_file))
+}
+
+fn normalize_spec_files(primary: &str, spec_files: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for spec_file in std::iter::once(primary).chain(spec_files.iter().map(String::as_str)) {
+        let spec_file = spec_file.trim();
+        if spec_file.is_empty() || out.iter().any(|existing| existing == spec_file) {
+            continue;
+        }
+        out.push(spec_file.to_string());
+    }
+    out
+}
+
+fn normalize_task_scopes(task_file: &mut TaskFile) {
+    let run_spec_files = normalize_spec_files(&task_file.spec_file, &task_file.spec_files);
+    task_file.spec_files = run_spec_files.clone();
+
+    for task in &mut task_file.tasks {
+        if task.phase.trim().is_empty() {
+            task.phase = task.group.clone();
+        }
+
+        if task.spec_files.is_empty() {
+            task.spec_files = match &task.spec_file {
+                Some(spec_file) => normalize_spec_files(spec_file, &[]),
+                None => run_spec_files.clone(),
+            };
+            continue;
+        }
+
+        let primary = task
+            .spec_file
+            .as_deref()
+            .unwrap_or_else(|| task.spec_files[0].as_str());
+        task.spec_files = normalize_spec_files(primary, &task.spec_files);
+    }
+}
+
+fn read_combined_spec_document(
+    context: &ConfigContext,
+    spec_files: &[String],
+) -> std::result::Result<SpecDocument, AppError> {
+    let mut documents = Vec::new();
+    for spec_file in spec_files {
+        let spec = SpecDocument::read(&context.repo_root.join(spec_file))?;
+        documents.push((spec_file.clone(), spec));
+    }
+    Ok(SpecDocument::from_spec_files(&documents))
+}
+
+fn task_spec_files(task: &Task, task_file: &TaskFile) -> Vec<String> {
+    if !task.spec_files.is_empty() {
+        return normalize_spec_files(
+            task.spec_file
+                .as_deref()
+                .unwrap_or_else(|| task.spec_files[0].as_str()),
+            &task.spec_files,
+        );
+    }
+    if let Some(spec_file) = &task.spec_file {
+        return normalize_spec_files(spec_file, &[]);
+    }
+    normalize_spec_files(&task_file.spec_file, &task_file.spec_files)
+}
+
+fn task_spec_label(spec_files: &[String]) -> String {
+    spec_files.join(", ")
+}
+
+fn task_phase_label(task: &Task) -> &str {
+    let phase = task.phase.trim();
+    if phase.is_empty() {
+        task.group.trim()
+    } else {
+        phase
+    }
+}
+
+fn task_in_watch_scope(task_file: &TaskFile, task: &Task, scope: &WatchScope) -> bool {
+    if let Some(group) = &scope.group
+        && task.group != *group
+    {
+        return false;
+    }
+    if let Some(phase) = &scope.phase
+        && task_phase_label(task) != phase
+    {
+        return false;
+    }
+    if let Some(until_phase) = &scope.until_phase {
+        let Some(target_rank) = phase_rank(task_file, until_phase) else {
+            return true;
+        };
+        let Some(task_rank) = phase_rank(task_file, task_phase_label(task)) else {
+            return false;
+        };
+        if task_rank > target_rank {
+            return false;
+        }
+    }
+    true
+}
+
+fn phase_rank(task_file: &TaskFile, phase: &str) -> Option<usize> {
+    let phase = phase.trim();
+    let mut rank = 0;
+    let mut seen = BTreeSet::new();
+    for task in &task_file.tasks {
+        let candidate = task_phase_label(task);
+        if !seen.insert(candidate) {
+            continue;
+        }
+        if candidate == phase {
+            return Some(rank);
+        }
+        rank += 1;
+    }
+    None
+}
+
+fn validate_watch_scope(
+    task_file: &TaskFile,
+    metadata: &RunMetadata,
+    scope: &WatchScope,
+) -> std::result::Result<(), AppError> {
+    if let Some(group) = &scope.group
+        && !task_file.tasks.iter().any(|task| task.group == *group)
+    {
+        return Err(AppError::Config(format!("unknown task group: {group}")));
+    }
+    if let Some(phase) = &scope.phase
+        && phase_rank(task_file, phase).is_none()
+        && metadata_phase_rank(metadata, phase).is_none()
+    {
+        return Err(AppError::Config(format!("unknown task phase: {phase}")));
+    }
+    if let Some(phase) = &scope.until_phase
+        && phase_rank(task_file, phase).is_none()
+        && metadata_phase_rank(metadata, phase).is_none()
+    {
+        return Err(AppError::Config(format!("unknown task phase: {phase}")));
+    }
+    Ok(())
+}
+
 fn repo_relative_slash_path(
     repo_root: &Path,
     path: &Path,
@@ -2880,18 +3603,29 @@ fn discover_run_metadata_for_spec(
     let ids = discover_run_ids(&store.repo_runs_dir)?;
     for id in ids {
         if let Ok(metadata) = store.read_metadata(&id)
-            && metadata.spec_file == spec_file
+            && (metadata.spec_file == spec_file
+                || metadata
+                    .spec_files
+                    .iter()
+                    .any(|candidate| candidate == spec_file))
         {
             return Ok(Some(metadata));
         }
         if let Ok(task_file) = store.read_task_file(&id)
-            && task_file.spec_file == spec_file
+            && (task_file.spec_file == spec_file
+                || task_file
+                    .spec_files
+                    .iter()
+                    .any(|candidate| candidate == spec_file))
         {
             return Ok(Some(RunMetadata {
                 schema_version: 1,
                 run_id: task_file.run_id,
                 branch: task_file.branch,
                 spec_file: task_file.spec_file,
+                spec_files: task_file.spec_files,
+                phases: Vec::new(),
+                active_phase: None,
                 problem_framing: ProblemFramingState::default(),
                 resolved_problem_file: None,
                 requirement_review: RequirementReviewState::default(),
@@ -3221,8 +3955,10 @@ fn parse_task_file_json(raw: &str) -> std::result::Result<TaskFile, String> {
     let mut value =
         serde_json::from_str::<Value>(raw).map_err(|err| format!("invalid JSON: {err}"))?;
     normalize_decompose_task_file_value(&mut value);
-    serde_json::from_value::<TaskFile>(value)
-        .map_err(|err| format!("invalid tasks.json schema: {err}"))
+    let mut task_file = serde_json::from_value::<TaskFile>(value)
+        .map_err(|err| format!("invalid tasks.json schema: {err}"))?;
+    normalize_task_scopes(&mut task_file);
+    Ok(task_file)
 }
 
 fn normalize_decompose_task_file_value(value: &mut Value) {
@@ -3244,6 +3980,16 @@ fn normalize_decompose_task_file_value(value: &mut Value) {
                 "output".to_string(),
                 Value::String(format!("output/{}.md", sanitize_task_output_stem(id))),
             );
+        }
+        if !task.contains_key("phase")
+            && let Some(group) = task.get("group").cloned()
+        {
+            task.insert("phase".to_string(), group);
+        }
+        if !task.contains_key("specFiles")
+            && let Some(spec_file) = task.get("specFile").cloned()
+        {
+            task.insert("specFiles".to_string(), Value::Array(vec![spec_file]));
         }
     }
 }
@@ -4985,6 +5731,8 @@ pub struct TaskFile {
     pub branch: String,
     #[serde(rename = "specFile")]
     pub spec_file: String,
+    #[serde(rename = "specFiles", default)]
+    pub spec_files: Vec<String>,
     #[serde(rename = "verificationCommands", default)]
     pub verification_commands: Vec<VerificationCommand>,
     pub tasks: Vec<Task>,
@@ -4999,6 +5747,8 @@ pub struct Task {
     pub priority: u64,
     #[serde(default)]
     pub group: String,
+    #[serde(default)]
+    pub phase: String,
     pub title: String,
     #[serde(rename = "maxAttempts", default)]
     pub max_attempts: Option<u64>,
@@ -5008,6 +5758,8 @@ pub struct Task {
     pub prompt: String,
     #[serde(rename = "specFile", default)]
     pub spec_file: Option<String>,
+    #[serde(rename = "specFiles", default)]
+    pub spec_files: Vec<String>,
     #[serde(rename = "dependsOn", default)]
     pub depends_on: Vec<String>,
     #[serde(
@@ -5196,6 +5948,9 @@ pub struct WatchOptions {
     pub run_id: Option<String>,
     pub interval_seconds: u64,
     pub max_failures: Option<u64>,
+    pub group: Option<String>,
+    pub phase: Option<String>,
+    pub until_phase: Option<String>,
     pub codex_bin: Option<PathBuf>,
 }
 
@@ -5248,6 +6003,13 @@ pub struct ResetTaskOptions {
     pub phase: TaskPhase,
     pub clear_attempts: bool,
     pub clear_review_attempts: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkipPhaseOptions {
+    pub run_id: Option<String>,
+    pub phase_id: String,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -5321,6 +6083,19 @@ pub struct ResetTaskResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkipPhaseResult {
+    pub run_id: String,
+    pub phase_id: String,
+    pub tasks_path: PathBuf,
+    pub state_path: PathBuf,
+    pub metadata_path: PathBuf,
+    pub ignored_tasks: usize,
+    pub already_done_tasks: usize,
+    pub reason: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SchedulerResult {
     pub run_id: String,
     pub message: String,
@@ -5358,6 +6133,13 @@ struct PreparedPhase {
     state_before_running: TaskState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct WatchScope {
+    group: Option<String>,
+    phase: Option<String>,
+    until_phase: Option<String>,
+}
+
 pub fn watch_run(
     start: &Path,
     options: WatchOptions,
@@ -5383,6 +6165,11 @@ pub fn watch_run_in_repo(
         .max(1);
     let mut consecutive_failures = 0;
     let mut completed = 0;
+    let scope = WatchScope {
+        group: options.group.clone(),
+        phase: options.phase.clone(),
+        until_phase: options.until_phase.clone(),
+    };
 
     loop {
         let recovered = recover_stale_running_tasks(&store, &run_id)?;
@@ -5394,15 +6181,43 @@ pub fn watch_run_in_repo(
         }
 
         let task_file = store.read_task_file(&run_id)?;
+        let metadata = read_metadata_or_task_file(&store, &run_id, &task_file)?;
+        validate_watch_scope(&task_file, &metadata, &scope)?;
         let state = store.read_run_state(&run_id)?;
-        let Some(task_id) = select_next_runnable_task(&task_file, &state)? else {
-            let blocked = count_tasks_with_status(&task_file, &state, TaskStatus::Blocked)?;
+        let Some(task_id) = select_next_runnable_task(&task_file, &state, &scope)? else {
+            let blocked =
+                count_tasks_with_status_in_scope(&task_file, &state, TaskStatus::Blocked, &scope)?;
             if blocked > 0 {
                 return Ok(SchedulerResult {
                     run_id,
                     message: format!("Run has {blocked} blocked task(s)"),
                     exit_code: 1,
                 });
+            }
+            if all_tasks_terminal(&task_file, &state)?
+                && let Some(outcome) = prepare_next_phase_for_watch(
+                    &context,
+                    &store,
+                    &run_id,
+                    &task_file,
+                    &scope,
+                    options.codex_bin.clone(),
+                )?
+            {
+                match outcome {
+                    PhasePrepareOutcome::Decomposed => {
+                        completed += 1;
+                        consecutive_failures = 0;
+                        continue;
+                    }
+                    PhasePrepareOutcome::Waiting => {
+                        return Ok(SchedulerResult {
+                            run_id,
+                            message: "Run is waiting for phase input".to_string(),
+                            exit_code: 0,
+                        });
+                    }
+                }
             }
             let message = if completed == 0 {
                 format!("No runnable tasks for run {run_id}")
@@ -6768,7 +7583,8 @@ fn read_final_review_spec(
     context: &ConfigContext,
     task_file: &TaskFile,
 ) -> std::result::Result<String, AppError> {
-    let spec = SpecDocument::read(&context.repo_root.join(&task_file.spec_file))?;
+    let spec_files = normalize_spec_files(&task_file.spec_file, &task_file.spec_files);
+    let spec = read_combined_spec_document(context, &spec_files)?;
     Ok(spec.body)
 }
 
@@ -7132,6 +7948,7 @@ fn append_final_fix_task(
         id: task_id.clone(),
         priority,
         group: "final-review".to_string(),
+        phase: "final-review".to_string(),
         title: format!("Fix final review round {round} MUST_FIX findings"),
         max_attempts: Some(1),
         timeout_seconds: None,
@@ -7140,6 +7957,7 @@ fn append_final_fix_task(
             "Fix only these final review MUST_FIX findings, preserve existing behavior, then summarize the changes.\n\nVerification degraded: {verification_degraded}\n\n```json\n{findings_json}\n```"
         ),
         spec_file: Some(task_file.spec_file.clone()),
+        spec_files: normalize_spec_files(&task_file.spec_file, &task_file.spec_files),
         depends_on: Vec::new(),
         review_criteria: vec![
             "All listed MUST_FIX findings are resolved.".to_string(),
@@ -7473,6 +8291,109 @@ pub fn reset_task(
     reset_task_in_repo(&repo_root, &home, options)
 }
 
+pub fn skip_phase(
+    start: &Path,
+    options: SkipPhaseOptions,
+) -> std::result::Result<SkipPhaseResult, AppError> {
+    let repo_root = find_repo_root(start)?;
+    let home = home_dir()?;
+    skip_phase_in_repo(&repo_root, &home, options)
+}
+
+pub fn skip_phase_in_repo(
+    repo_root: &Path,
+    home: &Path,
+    options: SkipPhaseOptions,
+) -> std::result::Result<SkipPhaseResult, AppError> {
+    let context = load_config(repo_root, home, true)?;
+    let store = RunStore::for_repo(&context.repo_root, &context.home_dir)
+        .map_err(|err| AppError::Runtime(format!("failed to resolve run store: {err}")))?;
+    let run_id = select_run_id(&store, options.run_id.as_deref())?;
+    let _execution_lock = store.try_acquire_execution_lock(&run_id)?;
+    recover_stale_running_tasks(&store, &run_id)?;
+    let now = current_timestamp()?;
+
+    let mut metadata = store.read_metadata(&run_id)?;
+    let phase = find_phase_metadata_mut(&mut metadata, &options.phase_id)?;
+    phase.decomposed = true;
+    phase
+        .extra
+        .insert("skippedAt".to_string(), Value::String(now.clone()));
+    if let Some(reason) = &options.reason {
+        phase
+            .extra
+            .insert("skipReason".to_string(), Value::String(reason.clone()));
+    } else {
+        phase.extra.remove("skipReason");
+    }
+    if metadata.active_phase.as_deref() == Some(options.phase_id.as_str()) {
+        metadata.active_phase = None;
+        metadata.problem_framing = ProblemFramingState::default();
+        metadata.requirement_review = RequirementReviewState::default();
+        metadata.resolved_problem_file = None;
+        metadata.resolved_spec_file = None;
+    }
+    store.write_metadata(&run_id, &metadata)?;
+
+    let tasks_path = store.tasks_path(&run_id)?;
+    let mut ignored_tasks = 0;
+    let mut already_done_tasks = 0;
+    if tasks_path.exists() {
+        let task_file = store.read_task_file(&run_id)?;
+        store.update_run_state(&run_id, |state| {
+            ensure_state_matches_tasks(&task_file, state)?;
+            state.problem_framing = ProblemFramingState::default();
+            state.requirement_review = RequirementReviewState::default();
+            for task in task_file
+                .tasks
+                .iter()
+                .filter(|task| task_phase_label(task) == options.phase_id)
+            {
+                let task_state = find_task_state_mut(state, &task.id)?;
+                match task_state.status {
+                    TaskStatus::Done => {
+                        already_done_tasks += 1;
+                    }
+                    TaskStatus::Ignored => {}
+                    TaskStatus::Running => {
+                        return Err(AppError::Runtime(format!(
+                            "task {} in phase {} is still running",
+                            task.id, options.phase_id
+                        )));
+                    }
+                    _ => {
+                        task_state.status = TaskStatus::Ignored;
+                        task_state.ignored_at = Some(now.clone());
+                        task_state.ignore_reason = options.reason.clone();
+                        task_state.finished_at = Some(now.clone());
+                        task_state.updated_at = Some(now.clone());
+                        clear_runner_marker(task_state);
+                        ignored_tasks += 1;
+                    }
+                }
+            }
+            Ok(())
+        })?;
+    }
+
+    let result = SkipPhaseResult {
+        run_id: run_id.clone(),
+        phase_id: options.phase_id.clone(),
+        tasks_path: store.tasks_path(&run_id)?,
+        state_path: store.state_path(&run_id)?,
+        metadata_path: store.metadata_path(&run_id)?,
+        ignored_tasks,
+        already_done_tasks,
+        reason: options.reason.clone(),
+        message: format!(
+            "Skipped phase {} (ignoredTasks={}, alreadyDoneTasks={})",
+            options.phase_id, ignored_tasks, already_done_tasks
+        ),
+    };
+    append_event_log(&store.run_dir(&run_id)?, &result.message)?;
+    Ok(result)
+}
+
 pub fn reset_task_in_repo(
     repo_root: &Path,
     home: &Path,
@@ -7608,6 +8529,24 @@ pub fn format_reset_text(result: &ResetTaskResult) -> String {
     out
 }
 
+pub fn format_skip_phase_text(result: &SkipPhaseResult) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("{}\n", result.message));
+    out.push_str(&format!("Run: {}\n", result.run_id));
+    out.push_str(&format!("Phase: {}\n", result.phase_id));
+    out.push_str(&format!("Metadata: {}\n", result.metadata_path.display()));
+    out.push_str(&format!("Tasks: {}\n", result.tasks_path.display()));
+    out.push_str(&format!("State: {}\n", result.state_path.display()));
+    if let Some(reason) = &result.reason {
+        out.push_str(&format!("Reason: {reason}\n"));
+    }
+    out.push_str(&format!(
+        "Next: codex-task watch --run-id {}\n",
+        result.run_id
+    ));
+    out
+}
+
 pub fn load_status(
     repo_root: &Path,
     home_dir: &Path,
@@ -7653,18 +8592,51 @@ pub fn load_status(
 }
 
 fn status_task_file_from_metadata(metadata: &RunMetadata) -> TaskFile {
+    let spec_file = metadata
+        .resolved_spec_file
+        .clone()
+        .or_else(|| metadata.resolved_problem_file.clone())
+        .unwrap_or_else(|| metadata.spec_file.clone());
+    let spec_files =
+        if metadata.resolved_spec_file.is_some() || metadata.resolved_problem_file.is_some() {
+            vec![spec_file.clone()]
+        } else {
+            normalize_spec_files(&metadata.spec_file, &metadata.spec_files)
+        };
     TaskFile {
         schema_version: 2,
         run_id: metadata.run_id.clone(),
         branch: metadata.branch.clone(),
-        spec_file: metadata
-            .resolved_spec_file
-            .clone()
-            .or_else(|| metadata.resolved_problem_file.clone())
-            .unwrap_or_else(|| metadata.spec_file.clone()),
+        spec_file,
+        spec_files,
         verification_commands: Vec::new(),
         tasks: Vec::new(),
         extra: Map::new(),
+    }
+}
+
+fn read_metadata_or_task_file(
+    store: &RunStore,
+    run_id: &str,
+    task_file: &TaskFile,
+) -> std::result::Result<RunMetadata, AppError> {
+    match store.read_metadata(run_id) {
+        Ok(metadata) => Ok(metadata),
+        Err(AppError::Io(_)) => Ok(RunMetadata {
+            schema_version: 1,
+            run_id: task_file.run_id.clone(),
+            branch: task_file.branch.clone(),
+            spec_file: task_file.spec_file.clone(),
+            spec_files: task_file.spec_files.clone(),
+            problem_framing: ProblemFramingState::default(),
+            resolved_problem_file: None,
+            requirement_review: RequirementReviewState::default(),
+            resolved_spec_file: None,
+            phases: Vec::new(),
+            active_phase: None,
+            extra: Map::new(),
+        }),
+        Err(err) => Err(err),
     }
 }
 
@@ -7973,6 +8945,7 @@ fn mark_stale_running(task: &Task, state: &mut TaskState) -> std::result::Result
 fn select_next_runnable_task(
     task_file: &TaskFile,
     state: &RunState,
+    scope: &WatchScope,
 ) -> std::result::Result<Option<String>, AppError> {
     let mut tasks = task_file.tasks.iter().collect::<Vec<_>>();
     tasks.sort_by(|left, right| {
@@ -7982,6 +8955,9 @@ fn select_next_runnable_task(
     });
 
     for task in tasks {
+        if !task_in_watch_scope(task_file, task, scope) {
+            continue;
+        }
         if runnable_status(task, task_file, state)? == RunnableCheck::Runnable {
             return Ok(Some(task.id.clone()));
         }
@@ -7989,15 +8965,17 @@ fn select_next_runnable_task(
     Ok(None)
 }
 
-fn count_tasks_with_status(
+fn count_tasks_with_status_in_scope(
     task_file: &TaskFile,
     state: &RunState,
     status: TaskStatus,
+    scope: &WatchScope,
 ) -> std::result::Result<usize, AppError> {
     let state_by_id = normalized_state_map(task_file, state)?;
     Ok(task_file
         .tasks
         .iter()
+        .filter(|task| task_in_watch_scope(task_file, task, scope))
         .filter(|task| {
             state_by_id
                 .get(task.id.as_str())
@@ -8005,6 +8983,82 @@ fn count_tasks_with_status(
                 .unwrap_or(false)
         })
         .count())
+}
+
+fn all_tasks_terminal(
+    task_file: &TaskFile,
+    state: &RunState,
+) -> std::result::Result<bool, AppError> {
+    let state_by_id = normalized_state_map(task_file, state)?;
+    Ok(task_file.tasks.iter().all(|task| {
+        state_by_id
+            .get(task.id.as_str())
+            .map(|task_state| matches!(task_state.status, TaskStatus::Done | TaskStatus::Ignored))
+            .unwrap_or(false)
+    }))
+}
+
+fn prepare_next_phase_for_watch(
+    context: &ConfigContext,
+    store: &RunStore,
+    run_id: &str,
+    task_file: &TaskFile,
+    scope: &WatchScope,
+    codex_bin: Option<PathBuf>,
+) -> std::result::Result<Option<PhasePrepareOutcome>, AppError> {
+    if scope.group.is_some() {
+        return Ok(None);
+    }
+    let metadata = match store.read_metadata(run_id) {
+        Ok(metadata) => metadata,
+        Err(AppError::Io(_)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let Some(phase) = metadata.phases.iter().find(|phase| {
+        !phase.decomposed && phase_allowed_by_watch_scope(&metadata, &phase.id, scope)
+    }) else {
+        return Ok(None);
+    };
+    let phase_id = phase.id.clone();
+    let mut warnings = Vec::new();
+    let append = !task_file.tasks.is_empty();
+    prepare_run_phase(
+        context,
+        store,
+        run_id,
+        &phase_id,
+        append,
+        codex_bin,
+        &mut warnings,
+    )
+    .map(Some)
+}
+
+fn phase_allowed_by_watch_scope(
+    metadata: &RunMetadata,
+    phase_id: &str,
+    scope: &WatchScope,
+) -> bool {
+    if let Some(phase) = &scope.phase {
+        return phase == phase_id;
+    }
+    if let Some(until_phase) = &scope.until_phase {
+        let Some(target_rank) = metadata_phase_rank(metadata, until_phase) else {
+            return false;
+        };
+        let Some(phase_rank) = metadata_phase_rank(metadata, phase_id) else {
+            return false;
+        };
+        return phase_rank <= target_rank;
+    }
+    true
+}
+
+fn metadata_phase_rank(metadata: &RunMetadata, phase_id: &str) -> Option<usize> {
+    metadata
+        .phases
+        .iter()
+        .position(|phase| phase.id == phase_id)
 }
 
 fn runnable_status(
@@ -9680,11 +10734,9 @@ fn render_analyze_prompt(
     output_path: &Path,
 ) -> std::result::Result<String, AppError> {
     let task_file = store.read_task_file(run_id)?;
-    let spec_file = task
-        .spec_file
-        .clone()
-        .unwrap_or_else(|| task_file.spec_file.clone());
-    let spec = SpecDocument::read(&context.repo_root.join(&spec_file))?;
+    let spec_files = task_spec_files(task, &task_file);
+    let spec = read_combined_spec_document(context, &spec_files)?;
+    let spec_file = task_spec_label(&spec_files);
     let input = AnalyzeTaskPromptInput {
         common: common_prompt_variables(context, store, run_id)?,
         task_id: task.id.clone(),
@@ -9711,11 +10763,9 @@ fn render_implement_prompt(
     state: &TaskState,
 ) -> std::result::Result<String, AppError> {
     let task_file = store.read_task_file(run_id)?;
-    let spec_file = task
-        .spec_file
-        .clone()
-        .unwrap_or_else(|| task_file.spec_file.clone());
-    let spec = SpecDocument::read(&context.repo_root.join(&spec_file))?;
+    let spec_files = task_spec_files(task, &task_file);
+    let spec = read_combined_spec_document(context, &spec_files)?;
+    let spec_file = task_spec_label(&spec_files);
     let analysis_output = state
         .analysis_output
         .as_deref()
@@ -9756,11 +10806,9 @@ fn render_review_task_prompt(
     output_path: &Path,
 ) -> std::result::Result<String, AppError> {
     let task_file = store.read_task_file(run_id)?;
-    let spec_file = task
-        .spec_file
-        .clone()
-        .unwrap_or_else(|| task_file.spec_file.clone());
-    let spec = SpecDocument::read(&context.repo_root.join(&spec_file))?;
+    let spec_files = task_spec_files(task, &task_file);
+    let spec = read_combined_spec_document(context, &spec_files)?;
+    let spec_file = task_spec_label(&spec_files);
     let run_dir = store.run_dir(run_id)?;
     let analysis_path = state.analysis_output.clone().unwrap_or_else(|| {
         analysis_output_path(&run_dir, &task.id)
@@ -10559,6 +11607,7 @@ pub fn read_task_file_with_migration(
     let source_version = raw_value.get("version").and_then(Value::as_u64);
     let mut task_file = serde_json::from_value::<TaskFile>(raw_value)
         .map_err(|err| AppError::Config(format!("invalid tasks file {}: {err}", path.display())))?;
+    normalize_task_scopes(&mut task_file);
     validate_task_file(&task_file)?;
 
     let report = if source_version != Some(2) {
@@ -10614,6 +11663,13 @@ pub fn validate_task_file(task_file: &TaskFile) -> std::result::Result<(), AppEr
             task_file.spec_file
         )));
     }
+    for spec_file in &task_file.spec_files {
+        if Path::new(spec_file).is_absolute() {
+            return Err(AppError::Config(format!(
+                "specFiles entries must be repo-relative: {spec_file}"
+            )));
+        }
+    }
 
     let mut ids = BTreeSet::new();
     for task in &task_file.tasks {
@@ -10623,6 +11679,22 @@ pub fn validate_task_file(task_file: &TaskFile) -> std::result::Result<(), AppEr
     }
 
     for task in &task_file.tasks {
+        if let Some(spec_file) = &task.spec_file
+            && Path::new(spec_file).is_absolute()
+        {
+            return Err(AppError::Config(format!(
+                "task {} specFile must be repo-relative: {spec_file}",
+                task.id
+            )));
+        }
+        for spec_file in &task.spec_files {
+            if Path::new(spec_file).is_absolute() {
+                return Err(AppError::Config(format!(
+                    "task {} specFiles entries must be repo-relative: {spec_file}",
+                    task.id
+                )));
+            }
+        }
         for dependency in &task.depends_on {
             if !ids.contains(dependency) {
                 return Err(AppError::Config(format!(
@@ -10660,6 +11732,48 @@ pub fn validate_run_metadata(metadata: &RunMetadata) -> std::result::Result<(), 
         return Err(AppError::Config(format!(
             "metadata specFile must be repo-relative: {}",
             metadata.spec_file
+        )));
+    }
+    for spec_file in &metadata.spec_files {
+        if Path::new(spec_file).is_absolute() {
+            return Err(AppError::Config(format!(
+                "metadata specFiles entries must be repo-relative: {spec_file}"
+            )));
+        }
+    }
+    let mut phase_ids = BTreeSet::new();
+    for phase in &metadata.phases {
+        if phase.id.trim().is_empty() {
+            return Err(AppError::Config(
+                "metadata phase id must not be empty".to_string(),
+            ));
+        }
+        if !phase_ids.insert(phase.id.clone()) {
+            return Err(AppError::Config(format!(
+                "duplicate metadata phase id {}",
+                phase.id
+            )));
+        }
+        if Path::new(&phase.spec_file).is_absolute() {
+            return Err(AppError::Config(format!(
+                "metadata phase {} specFile must be repo-relative: {}",
+                phase.id, phase.spec_file
+            )));
+        }
+        for spec_file in &phase.spec_files {
+            if Path::new(spec_file).is_absolute() {
+                return Err(AppError::Config(format!(
+                    "metadata phase {} specFiles entries must be repo-relative: {spec_file}",
+                    phase.id
+                )));
+            }
+        }
+    }
+    if let Some(active_phase) = &metadata.active_phase
+        && !phase_ids.contains(active_phase)
+    {
+        return Err(AppError::Config(format!(
+            "activePhase references unknown phase: {active_phase}"
         )));
     }
     Ok(())
@@ -11491,18 +12605,21 @@ printf '   \n' > "{}"
             run_id: "sample".to_string(),
             branch: "feat/sample".to_string(),
             spec_file: "docs/roadmap/sample.md".to_string(),
+            spec_files: vec!["docs/roadmap/sample.md".to_string()],
             verification_commands: Vec::new(),
             tasks: vec![
                 Task {
                     id: "p1".to_string(),
                     priority: 1,
                     group: "g".to_string(),
+                    phase: "g".to_string(),
                     title: "Pending".to_string(),
                     max_attempts: None,
                     timeout_seconds: None,
                     output: "out.md".to_string(),
                     prompt: "do it".to_string(),
                     spec_file: None,
+                    spec_files: Vec::new(),
                     depends_on: Vec::new(),
                     review_criteria: Vec::new(),
                     analyze_timeout_seconds: None,
@@ -11517,12 +12634,14 @@ printf '   \n' > "{}"
                     id: "p2".to_string(),
                     priority: 2,
                     group: "g".to_string(),
+                    phase: "g".to_string(),
                     title: "Done".to_string(),
                     max_attempts: None,
                     timeout_seconds: None,
                     output: "out.md".to_string(),
                     prompt: "do it".to_string(),
                     spec_file: None,
+                    spec_files: Vec::new(),
                     depends_on: vec!["p1".to_string()],
                     review_criteria: Vec::new(),
                     analyze_timeout_seconds: None,
@@ -11656,6 +12775,9 @@ printf '   \n' > "{}"
                     run_id: "readme".to_string(),
                     branch: "feat/readme".to_string(),
                     spec_file: "docs/roadmap/agent-platform/README.md".to_string(),
+                    spec_files: vec!["docs/roadmap/agent-platform/README.md".to_string()],
+                    phases: Vec::new(),
+                    active_phase: None,
                     problem_framing: ProblemFramingState {
                         status: ProblemFramingStatus::Resolved,
                         ..ProblemFramingState::default()
@@ -11745,6 +12867,43 @@ printf '   \n' > "{}"
         assert!(!encoded.contains("schema_version"));
         assert!(!encoded.contains("migration_from"));
         assert!(!encoded.contains("migration_to"));
+    }
+
+    #[test]
+    fn verification_command_accepts_null_timeout_seconds() {
+        let task_file = parse_task_file_json(
+            r#"{
+  "version": 2,
+  "runId": "run",
+  "branch": "feat/run",
+  "specFile": "spec.md",
+  "tasks": [
+    {
+      "id": "p1",
+      "priority": 1,
+      "group": "backend",
+      "title": "Task",
+      "output": "output/p1.md",
+      "prompt": "Do it.",
+      "dependsOn": [],
+      "reviewCriteria": [],
+      "verificationCommands": [
+        {
+          "name": "unit",
+          "command": "cargo test",
+          "required": true,
+          "timeoutSeconds": null
+        }
+      ]
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let verification = &task_file.tasks[0].verification_commands[0];
+        assert_eq!(verification.name, "unit");
+        assert_eq!(verification.timeout_seconds, None);
     }
 
     #[test]
@@ -11936,6 +13095,7 @@ printf '   \n' > "{}"
             &repo,
             StartOptions {
                 spec_path: PathBuf::from("docs/roadmap/feature.md"),
+                spec_paths: Vec::new(),
                 run_id: None,
                 branch: None,
                 resume: false,
@@ -12012,6 +13172,7 @@ add_include = ["src/**"]
             &repo,
             StartOptions {
                 spec_path: PathBuf::from("docs/roadmap/feature.md"),
+                spec_paths: Vec::new(),
                 run_id: None,
                 branch: None,
                 resume: false,
@@ -12043,6 +13204,9 @@ add_include = ["src/**"]
                 run_id: Some("feature".to_string()),
                 interval_seconds: 0,
                 max_failures: Some(1),
+                group: None,
+                phase: None,
+                until_phase: None,
                 codex_bin: Some(watch_codex),
             },
         )
@@ -12082,6 +13246,7 @@ add_include = ["src/**"]
             &repo,
             StartOptions {
                 spec_path: PathBuf::from("docs/spec.md"),
+                spec_paths: Vec::new(),
                 run_id: None,
                 branch: None,
                 resume: false,
@@ -12097,6 +13262,7 @@ add_include = ["src/**"]
             &repo,
             StartOptions {
                 spec_path: PathBuf::from("docs/spec.md"),
+                spec_paths: Vec::new(),
                 run_id: None,
                 branch: None,
                 resume: false,
@@ -12133,6 +13299,7 @@ add_include = ["src/**"]
             &repo,
             StartOptions {
                 spec_path: PathBuf::from("feature.md"),
+                spec_paths: Vec::new(),
                 run_id: None,
                 branch: None,
                 resume: false,
@@ -12180,10 +13347,79 @@ add_include = ["src/**"]
         let task = &parsed.task_file.tasks[0];
         assert_eq!(task.prompt, "Update the roadmap docs.");
         assert_eq!(task.output, "output/t001.md");
+        assert_eq!(
+            parsed.task_file.spec_files,
+            vec![".codex/task-runs/readme/resolved-problem.md".to_string()]
+        );
+        assert_eq!(task.phase, "docs");
+        assert_eq!(
+            task.spec_files,
+            vec![".codex/task-runs/readme/resolved-problem.md".to_string()]
+        );
         assert_eq!(task.verification_commands.len(), 1);
         assert_eq!(
             task.verification_commands[0].command,
             "git diff --check docs/roadmap/agent-platform/README.md"
+        );
+    }
+
+    #[test]
+    fn decompose_output_preserves_task_phase_and_spec_files() {
+        let parsed = parse_decompose_output(
+            r#"{
+  "version": 2,
+  "runId": "roadmap",
+  "branch": "feat/roadmap",
+  "specFile": "docs/roadmap/ai-platform/01-foundation-data-model.md",
+  "specFiles": [
+    "docs/roadmap/ai-platform/01-foundation-data-model.md",
+    "docs/roadmap/ai-platform/02-domain-event-outbox-runtime.md"
+  ],
+  "tasks": [
+    {
+      "id": "agent-01",
+      "priority": 1,
+      "group": "foundation",
+      "phase": "01-foundation-data-model",
+      "title": "Add data model",
+      "output": "output/agent-01.md",
+      "prompt": "Implement only the foundation data model.",
+      "specFiles": ["docs/roadmap/ai-platform/01-foundation-data-model.md"],
+      "dependsOn": [],
+      "reviewCriteria": [],
+      "verificationCommands": []
+    },
+    {
+      "id": "agent-02",
+      "priority": 2,
+      "group": "runtime",
+      "phase": "02-domain-event-outbox-runtime",
+      "title": "Add outbox runtime",
+      "output": "output/agent-02.md",
+      "prompt": "Implement only the outbox runtime.",
+      "specFiles": ["docs/roadmap/ai-platform/02-domain-event-outbox-runtime.md"],
+      "dependsOn": ["agent-01"],
+      "reviewCriteria": [],
+      "verificationCommands": []
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.task_file.spec_files.len(), 2);
+        assert_eq!(parsed.task_file.tasks[0].phase, "01-foundation-data-model");
+        assert_eq!(
+            parsed.task_file.tasks[0].spec_files,
+            vec!["docs/roadmap/ai-platform/01-foundation-data-model.md".to_string()]
+        );
+        assert_eq!(
+            parsed.task_file.tasks[1].phase,
+            "02-domain-event-outbox-runtime"
+        );
+        assert_eq!(
+            parsed.task_file.tasks[1].spec_files,
+            vec!["docs/roadmap/ai-platform/02-domain-event-outbox-runtime.md".to_string()]
         );
     }
 
@@ -12209,6 +13445,7 @@ add_include = ["src/**"]
             &repo,
             StartOptions {
                 spec_path: PathBuf::from("invalid-json.md"),
+                spec_paths: Vec::new(),
                 run_id: None,
                 branch: None,
                 resume: false,
@@ -12222,7 +13459,7 @@ add_include = ["src/**"]
         let run_dir = store.run_dir("invalid-json").unwrap();
         assert!(!store.tasks_path("invalid-json").unwrap().exists());
         assert_eq!(
-            fs::read_to_string(run_dir.join("last-message.md"))
+            fs::read_to_string(run_dir.join("logs/invalid-json.decompose.last-message.md"))
                 .unwrap()
                 .trim_end(),
             "not json"
@@ -12253,6 +13490,7 @@ add_include = ["src/**"]
             &repo,
             StartOptions {
                 spec_path: PathBuf::from("codex-fail.md"),
+                spec_paths: Vec::new(),
                 run_id: None,
                 branch: None,
                 resume: false,
@@ -12266,7 +13504,7 @@ add_include = ["src/**"]
         let run_dir = store.run_dir("codex-fail").unwrap();
         assert!(!store.tasks_path("codex-fail").unwrap().exists());
         assert!(
-            fs::read_to_string(run_dir.join("logs/decompose.stderr.log"))
+            fs::read_to_string(run_dir.join("logs/codex-fail.decompose.stderr.log"))
                 .unwrap()
                 .contains("codex failed")
         );
@@ -12300,6 +13538,7 @@ add_include = ["src/**"]
             &repo,
             StartOptions {
                 spec_path: PathBuf::from("feature.md"),
+                spec_paths: Vec::new(),
                 run_id: None,
                 branch: None,
                 resume: false,
@@ -12359,6 +13598,7 @@ add_include = ["src/**"]
             &repo,
             StartOptions {
                 spec_path: PathBuf::from("feature.md"),
+                spec_paths: Vec::new(),
                 run_id: None,
                 branch: None,
                 resume: false,
@@ -12372,7 +13612,7 @@ add_include = ["src/**"]
             .replace("TODO", "Use Option A and keep auth boundaries.");
         fs::write(&decision_path, decision).unwrap();
 
-        let resolved_problem_file = ".codex/task-runs/feature/resolved-problem.md";
+        let resolved_problem_file = ".codex/task-runs/feature/phases/feature/resolved-problem.md";
         let resume_codex = fake_codex_script(
             temp.path(),
             &resolve_problem_then_requirement_clear_then_decompose_script(
@@ -12435,6 +13675,7 @@ add_include = ["src/**"]
             &repo,
             StartOptions {
                 spec_path: PathBuf::from("feature.md"),
+                spec_paths: Vec::new(),
                 run_id: None,
                 branch: None,
                 resume: false,
@@ -12448,7 +13689,7 @@ add_include = ["src/**"]
             .replace("TODO", "Use Option A and keep auth boundaries.");
         fs::write(&decision_path, decision).unwrap();
 
-        let resolved_problem_file = ".codex/task-runs/feature/resolved-problem.md";
+        let resolved_problem_file = ".codex/task-runs/feature/phases/feature/resolved-problem.md";
         let first_resume_codex = fake_codex_script(
             temp.path(),
             &resolve_problem_then_requirement_clear_then_decompose_script(
@@ -12525,6 +13766,7 @@ add_include = ["src/**"]
             &repo,
             StartOptions {
                 spec_path: PathBuf::from("feature.md"),
+                spec_paths: Vec::new(),
                 run_id: None,
                 branch: None,
                 resume: false,
@@ -12585,6 +13827,7 @@ add_include = ["src/**"]
             &repo,
             StartOptions {
                 spec_path: PathBuf::from("feature.md"),
+                spec_paths: Vec::new(),
                 run_id: None,
                 branch: None,
                 resume: false,
@@ -12599,7 +13842,7 @@ add_include = ["src/**"]
         )
         .unwrap();
 
-        let resolved_spec_file = ".codex/task-runs/feature/resolved-spec.md";
+        let resolved_spec_file = ".codex/task-runs/feature/phases/feature/resolved-spec.md";
         let resume_codex = fake_codex_script(
             temp.path(),
             &resolve_then_decompose_script(
@@ -12678,6 +13921,9 @@ add_include = ["src/**"]
                 run_id: Some("run".to_string()),
                 interval_seconds: 0,
                 max_failures: Some(1),
+                group: None,
+                phase: None,
+                until_phase: None,
                 codex_bin: Some(codex),
             },
         )
@@ -12697,6 +13943,293 @@ add_include = ["src/**"]
         let p3 = find_task_state(&state, "p3").unwrap();
         assert_eq!(p3.status, TaskStatus::Done);
         assert_eq!(p3.phase, Some(TaskPhase::Done));
+    }
+
+    #[test]
+    fn scheduler_scope_filters_by_roadmap_phase() {
+        let mut p1 = sample_task("p1", 1);
+        p1.phase = "01-foundation-data-model".to_string();
+        p1.spec_files = vec!["docs/roadmap/ai-platform/01-foundation-data-model.md".to_string()];
+        let mut p2 = sample_task("p2", 2);
+        p2.phase = "02-domain-event-outbox-runtime".to_string();
+        p2.spec_files =
+            vec!["docs/roadmap/ai-platform/02-domain-event-outbox-runtime.md".to_string()];
+        let task_file = sample_run_task_file(
+            "run",
+            "docs/roadmap/ai-platform/01-foundation-data-model.md",
+            vec![p1, p2],
+        );
+        let state = initial_run_state(&task_file);
+
+        let phase_scope = WatchScope {
+            phase: Some("02-domain-event-outbox-runtime".to_string()),
+            ..WatchScope::default()
+        };
+        assert_eq!(
+            select_next_runnable_task(&task_file, &state, &phase_scope).unwrap(),
+            Some("p2".to_string())
+        );
+
+        let until_scope = WatchScope {
+            until_phase: Some("01-foundation-data-model".to_string()),
+            ..WatchScope::default()
+        };
+        assert_eq!(
+            select_next_runnable_task(&task_file, &state, &until_scope).unwrap(),
+            Some("p1".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_directory_creates_phase_index_and_decomposes_only_first_phase() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let home = temp.path().join("home");
+        init_test_repo(&repo);
+        fs::create_dir_all(repo.join("docs/roadmap")).unwrap();
+        fs::write(repo.join("docs/roadmap/02-runtime.md"), "# Runtime\n").unwrap();
+        fs::write(repo.join("docs/roadmap/01-foundation.md"), "# Foundation\n").unwrap();
+        fs::write(repo.join("docs/roadmap/notes.txt"), "ignore\n").unwrap();
+        git(&repo, ["add", "."]);
+        git(&repo, ["commit", "-m", "specs"]);
+
+        let codex = fake_codex_script(
+            temp.path(),
+            &requirement_clear_then_last_message_script(&sample_decompose_json(
+                "roadmap",
+                "feat/roadmap",
+                "docs/roadmap/01-foundation.md",
+            )),
+        );
+        start_run_in_repo(
+            &repo,
+            &home,
+            &repo,
+            StartOptions {
+                spec_path: PathBuf::from("docs/roadmap"),
+                spec_paths: Vec::new(),
+                run_id: Some("roadmap".to_string()),
+                branch: None,
+                resume: false,
+                codex_bin: Some(codex),
+            },
+        )
+        .unwrap();
+
+        let store = RunStore::for_repo(&repo, &home).unwrap();
+        let metadata = store.read_metadata("roadmap").unwrap();
+        assert_eq!(
+            metadata
+                .phases
+                .iter()
+                .map(|phase| phase.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["01-foundation", "02-runtime"]
+        );
+        assert!(metadata.phases[0].decomposed);
+        assert!(!metadata.phases[1].decomposed);
+        let task_file = store.read_task_file("roadmap").unwrap();
+        assert_eq!(task_file.spec_file, "docs/roadmap/01-foundation.md");
+        assert_eq!(task_file.tasks.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn phase_preparation_appends_next_phase_tasks_without_overwriting_done_tasks() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let home = temp.path().join("home");
+        init_test_repo(&repo);
+        fs::create_dir_all(repo.join("docs/roadmap")).unwrap();
+        fs::write(repo.join("docs/roadmap/01-foundation.md"), "# Foundation\n").unwrap();
+        fs::write(repo.join("docs/roadmap/02-runtime.md"), "# Runtime\n").unwrap();
+        git(&repo, ["add", "."]);
+        git(&repo, ["commit", "-m", "specs"]);
+
+        let store = RunStore::for_repo(&repo, &home).unwrap();
+        store.ensure_repo_dir().unwrap();
+        let mut first_task = sample_task("p1", 1);
+        first_task.phase = "01-foundation".to_string();
+        first_task.spec_files = vec!["docs/roadmap/01-foundation.md".to_string()];
+        let task_file =
+            sample_run_task_file("roadmap", "docs/roadmap/01-foundation.md", vec![first_task]);
+        store.write_task_file("roadmap", &task_file).unwrap();
+        let mut state = initial_run_state(&task_file);
+        state.tasks[0].status = TaskStatus::Done;
+        state.tasks[0].phase = Some(TaskPhase::Done);
+        store.write_run_state("roadmap", &state).unwrap();
+        store
+            .write_metadata(
+                "roadmap",
+                &RunMetadata {
+                    schema_version: 1,
+                    run_id: "roadmap".to_string(),
+                    branch: "feat/roadmap".to_string(),
+                    spec_file: "docs/roadmap/01-foundation.md".to_string(),
+                    spec_files: vec![
+                        "docs/roadmap/01-foundation.md".to_string(),
+                        "docs/roadmap/02-runtime.md".to_string(),
+                    ],
+                    problem_framing: ProblemFramingState::default(),
+                    resolved_problem_file: None,
+                    requirement_review: RequirementReviewState::default(),
+                    resolved_spec_file: None,
+                    phases: vec![
+                        RunPhaseMetadata {
+                            id: "01-foundation".to_string(),
+                            spec_file: "docs/roadmap/01-foundation.md".to_string(),
+                            spec_files: vec!["docs/roadmap/01-foundation.md".to_string()],
+                            problem_framing: ProblemFramingState {
+                                status: ProblemFramingStatus::Clear,
+                                ..ProblemFramingState::default()
+                            },
+                            resolved_problem_file: None,
+                            requirement_review: RequirementReviewState {
+                                status: RequirementReviewStatus::Clear,
+                                ..RequirementReviewState::default()
+                            },
+                            resolved_spec_file: None,
+                            decomposed: true,
+                            extra: Map::new(),
+                        },
+                        RunPhaseMetadata {
+                            id: "02-runtime".to_string(),
+                            spec_file: "docs/roadmap/02-runtime.md".to_string(),
+                            spec_files: vec!["docs/roadmap/02-runtime.md".to_string()],
+                            problem_framing: ProblemFramingState::default(),
+                            resolved_problem_file: None,
+                            requirement_review: RequirementReviewState::default(),
+                            resolved_spec_file: None,
+                            decomposed: false,
+                            extra: Map::new(),
+                        },
+                    ],
+                    active_phase: None,
+                    extra: Map::new(),
+                },
+            )
+            .unwrap();
+
+        let second_phase_json =
+            sample_decompose_json("roadmap", "feat/roadmap", "docs/roadmap/02-runtime.md")
+                .replace("\"p1\"", "\"p2\"")
+                .replace("output/p1.md", "output/p2.md")
+                .replace("Do p1", "Do p2")
+                .replace("Implement p1.", "Implement p2.");
+        let codex = fake_codex_script(
+            temp.path(),
+            &requirement_clear_then_last_message_script(&second_phase_json),
+        );
+        let context = load_config(&repo, &home, true).unwrap();
+        let outcome = prepare_next_phase_for_watch(
+            &context,
+            &store,
+            "roadmap",
+            &task_file,
+            &WatchScope::default(),
+            Some(codex),
+        )
+        .unwrap();
+        assert_eq!(outcome, Some(PhasePrepareOutcome::Decomposed));
+        let task_file = store.read_task_file("roadmap").unwrap();
+        assert_eq!(task_file.tasks.len(), 2);
+        assert_eq!(task_file.tasks[0].id, "p1");
+        assert_eq!(task_file.tasks[1].id, "p2");
+        let metadata = store.read_metadata("roadmap").unwrap();
+        assert!(metadata.phases[1].decomposed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skip_phase_marks_phase_skipped_and_ignores_unfinished_tasks() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let home = temp.path().join("home");
+        init_test_repo(&repo);
+        fs::create_dir_all(repo.join("docs/roadmap")).unwrap();
+        fs::write(repo.join("docs/roadmap/01-foundation.md"), "# Foundation\n").unwrap();
+        git(&repo, ["add", "."]);
+        git(&repo, ["commit", "-m", "spec"]);
+
+        let store = RunStore::for_repo(&repo, &home).unwrap();
+        store.ensure_repo_dir().unwrap();
+        let mut p1 = sample_task("p1", 1);
+        p1.phase = "01-foundation".to_string();
+        let mut p2 = sample_task("p2", 2);
+        p2.phase = "01-foundation".to_string();
+        let task_file =
+            sample_run_task_file("roadmap", "docs/roadmap/01-foundation.md", vec![p1, p2]);
+        store.write_task_file("roadmap", &task_file).unwrap();
+        let mut state = initial_run_state(&task_file);
+        state.tasks[1].status = TaskStatus::Done;
+        state.tasks[1].phase = Some(TaskPhase::Done);
+        store.write_run_state("roadmap", &state).unwrap();
+        store
+            .write_metadata(
+                "roadmap",
+                &RunMetadata {
+                    schema_version: 1,
+                    run_id: "roadmap".to_string(),
+                    branch: "feat/roadmap".to_string(),
+                    spec_file: "docs/roadmap/01-foundation.md".to_string(),
+                    spec_files: vec!["docs/roadmap/01-foundation.md".to_string()],
+                    problem_framing: ProblemFramingState {
+                        status: ProblemFramingStatus::NeedsDecision,
+                        ..ProblemFramingState::default()
+                    },
+                    resolved_problem_file: None,
+                    requirement_review: RequirementReviewState::default(),
+                    resolved_spec_file: None,
+                    phases: vec![RunPhaseMetadata {
+                        id: "01-foundation".to_string(),
+                        spec_file: "docs/roadmap/01-foundation.md".to_string(),
+                        spec_files: vec!["docs/roadmap/01-foundation.md".to_string()],
+                        problem_framing: ProblemFramingState::default(),
+                        resolved_problem_file: None,
+                        requirement_review: RequirementReviewState::default(),
+                        resolved_spec_file: None,
+                        decomposed: false,
+                        extra: Map::new(),
+                    }],
+                    active_phase: Some("01-foundation".to_string()),
+                    extra: Map::new(),
+                },
+            )
+            .unwrap();
+
+        let result = skip_phase_in_repo(
+            &repo,
+            &home,
+            SkipPhaseOptions {
+                run_id: Some("roadmap".to_string()),
+                phase_id: "01-foundation".to_string(),
+                reason: Some("not needed".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.ignored_tasks, 1);
+        assert_eq!(result.already_done_tasks, 1);
+        let metadata = store.read_metadata("roadmap").unwrap();
+        assert!(metadata.phases[0].decomposed);
+        assert_eq!(metadata.active_phase, None);
+        assert_eq!(
+            metadata.phases[0]
+                .extra
+                .get("skipReason")
+                .and_then(Value::as_str),
+            Some("not needed")
+        );
+        let state = store.read_run_state("roadmap").unwrap();
+        assert_eq!(
+            find_task_state(&state, "p1").unwrap().status,
+            TaskStatus::Ignored
+        );
+        assert_eq!(
+            find_task_state(&state, "p2").unwrap().status,
+            TaskStatus::Done
+        );
     }
 
     #[cfg(unix)]
@@ -12986,6 +14519,9 @@ exit 99
                 run_id: Some("run".to_string()),
                 interval_seconds: 0,
                 max_failures: Some(1),
+                group: None,
+                phase: None,
+                until_phase: None,
                 codex_bin: Some(fake_codex_script(temp.path(), "exit 99")),
             },
         )
@@ -13917,6 +15453,9 @@ exit 99
                 run_id: Some("run".to_string()),
                 interval_seconds: 0,
                 max_failures: Some(1),
+                group: None,
+                phase: None,
+                until_phase: None,
                 codex_bin: Some(codex),
             },
         )
@@ -15215,12 +16754,14 @@ exit 9
             id: id.to_string(),
             priority,
             group: "scheduler".to_string(),
+            phase: "scheduler".to_string(),
             title: format!("Task {id}"),
             max_attempts: Some(3),
             timeout_seconds: Some(20),
             output: format!("output/{id}.md"),
             prompt: format!("Implement {id}."),
             spec_file: None,
+            spec_files: Vec::new(),
             depends_on: Vec::new(),
             review_criteria: Vec::new(),
             analyze_timeout_seconds: Some(20),
@@ -15239,6 +16780,7 @@ exit 9
             run_id: run_id.to_string(),
             branch: format!("feat/{run_id}"),
             spec_file: spec_file.to_string(),
+            spec_files: vec![spec_file.to_string()],
             verification_commands: Vec::new(),
             tasks,
             extra: Map::new(),
